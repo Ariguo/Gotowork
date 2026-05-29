@@ -47,6 +47,7 @@ static NSString * const SettingCalendarMinBlockMinutesKey = @"calendar_min_block
 static NSString * const IgnoredCalendarBlockKeysKey = @"ignored_calendar_block_keys";
 static NSString * const ProjectLabelsByBlockKeyKey = @"project_labels_by_block_key";
 static NSString * const BlockTitlesByBlockKeyKey = @"block_titles_by_block_key";
+static NSString * const AppWriteMappingsByKeyKey = @"app_write_mappings_by_key";
 static NSString * const AppColorOverridesByKeyKey = @"app_color_overrides_by_key";
 static NSString * const ManualCalendarBlocksKey = @"manual_calendar_blocks";
 
@@ -1847,15 +1848,35 @@ static NSString *CalendarBlockKeyForBlock(NSDictionary *block) {
     return CalendarBlockKeyForDates(block[@"start"], block[@"end"]);
 }
 
+static NSString *TrimmedUserText(NSString *value) {
+    return [[value ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] copy];
+}
+
+static NSDictionary *AppWriteMappingForBlock(NSDictionary *block, NSDictionary *appWriteMappings) {
+    NSString *appKey = block[@"key"];
+    NSDictionary *mapping = appKey.length > 0 ? appWriteMappings[appKey] : nil;
+    return [mapping isKindOfClass:NSDictionary.class] ? mapping : nil;
+}
+
 static NSArray *CalendarCandidatesWithState(NSArray *candidates,
                                             NSSet<NSString *> *existingKeys,
                                             NSSet<NSString *> *ignoredKeys,
+                                            NSDictionary<NSString *, NSDictionary *> *appWriteMappings,
                                             NSDictionary<NSString *, NSString *> *projectLabels,
                                             NSDictionary<NSString *, NSString *> *blockTitles) {
     NSMutableArray *annotated = [NSMutableArray arrayWithCapacity:candidates.count];
     for (NSDictionary *candidate in candidates) {
         NSMutableDictionary *copy = [candidate mutableCopy];
         copy[@"visual_layer"] = @"calendar";
+        NSDictionary *mapping = AppWriteMappingForBlock(copy, appWriteMappings ?: @{});
+        NSString *mappedProject = mapping[@"project_title"];
+        if (mappedProject.length > 0) {
+            copy[@"project_title"] = mappedProject;
+        }
+        NSString *mappedTitle = mapping[@"event_title"];
+        if (mappedTitle.length > 0) {
+            copy[@"event_title"] = mappedTitle;
+        }
         NSString *key = CalendarBlockKeyForBlock(copy);
         if (key.length > 0 && [ignoredKeys containsObject:key]) {
             continue;
@@ -2097,6 +2118,7 @@ static NSDictionary *DashboardStats(SegmentStore *store,
                                     NSDictionary *openSegment,
                                     NSSet<NSString *> *existingCalendarKeys,
                                     NSSet<NSString *> *ignoredCalendarKeys,
+                                    NSDictionary<NSString *, NSDictionary *> *appWriteMappings,
                                     NSDictionary<NSString *, NSString *> *projectLabels,
                                     NSDictionary<NSString *, NSString *> *blockTitles,
                                     NSArray *manualRecords) {
@@ -2144,10 +2166,20 @@ static NSDictionary *DashboardStats(SegmentStore *store,
     NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, manualRecords, selectedStart),
                                                       existingCalendarKeys ?: [NSSet set],
                                                       ignoredCalendarKeys ?: [NSSet set],
+                                                      appWriteMappings ?: @{},
                                                       projectLabels ?: @{},
                                                       blockTitles ?: @{});
     NSMutableSet<NSString *> *projectSet = [NSMutableSet set];
     for (NSString *project in (projectLabels ?: @{}).allValues) {
+        if (project.length > 0) {
+            [projectSet addObject:project];
+        }
+    }
+    for (NSDictionary *mapping in (appWriteMappings ?: @{}).allValues) {
+        if (![mapping isKindOfClass:NSDictionary.class]) {
+            continue;
+        }
+        NSString *project = mapping[@"project_title"];
         if (project.length > 0) {
             [projectSet addObject:project];
         }
@@ -5974,6 +6006,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
              openSegment:(NSDictionary *)openSegment
      existingCalendarKeys:(NSSet<NSString *> *)existingCalendarKeys
      ignoredCalendarKeys:(NSSet<NSString *> *)ignoredCalendarKeys
+	    appWriteMappings:(NSDictionary<NSString *, NSDictionary *> *)appWriteMappings
            projectLabels:(NSDictionary<NSString *, NSString *> *)projectLabels
              blockTitles:(NSDictionary<NSString *, NSString *> *)blockTitles
              manualBlocks:(NSArray *)manualBlocks
@@ -6024,6 +6057,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
              openSegment:(NSDictionary *)openSegment
      existingCalendarKeys:(NSSet<NSString *> *)existingCalendarKeys
      ignoredCalendarKeys:(NSSet<NSString *> *)ignoredCalendarKeys
+	    appWriteMappings:(NSDictionary<NSString *, NSDictionary *> *)appWriteMappings
            projectLabels:(NSDictionary<NSString *, NSString *> *)projectLabels
              blockTitles:(NSDictionary<NSString *, NSString *> *)blockTitles
              manualBlocks:(NSArray *)manualBlocks
@@ -6035,6 +6069,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
                                          openSegment,
                                          existingCalendarKeys,
                                          ignoredCalendarKeys,
+                                         appWriteMappings,
                                          projectLabels,
                                          blockTitles,
                                          manualBlocks ?: @[]);
@@ -6199,6 +6234,11 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     return [titles isKindOfClass:NSDictionary.class] ? titles : @{};
 }
 
+- (NSDictionary<NSString *, NSDictionary *> *)appWriteMappingsByAppKey {
+    NSDictionary *mappings = [[NSUserDefaults standardUserDefaults] dictionaryForKey:AppWriteMappingsByKeyKey];
+    return [mappings isKindOfClass:NSDictionary.class] ? mappings : @{};
+}
+
 - (NSArray *)manualCalendarBlockRecords {
     NSArray *records = [[NSUserDefaults standardUserDefaults] arrayForKey:ManualCalendarBlocksKey];
     return [records isKindOfClass:NSArray.class] ? records : @[];
@@ -6226,14 +6266,16 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSDate *dashboardDate = [self dashboardDate];
     NSSet<NSString *> *existingKeys = [self existingCalendarBlockKeysForDay:dashboardDate];
     NSSet<NSString *> *ignoredKeys = [self ignoredCalendarBlockKeys];
+    NSDictionary<NSString *, NSDictionary *> *appWriteMappings = [self appWriteMappingsByAppKey];
     NSDictionary<NSString *, NSString *> *projectLabels = [self projectLabelsByBlockKey];
     NSDictionary<NSString *, NSString *> *blockTitles = [self blockTitlesByBlockKey];
     NSArray *manualBlocks = [self manualCalendarBlockRecords];
     [self.dashboardController refreshWithStore:self.store
                                    displayDate:dashboardDate
                                    openSegment:[self.tracker currentDashboardSegment]
-                           existingCalendarKeys:existingKeys
-                            ignoredCalendarKeys:ignoredKeys
+                            existingCalendarKeys:existingKeys
+                             ignoredCalendarKeys:ignoredKeys
+	                          appWriteMappings:appWriteMappings
                                   projectLabels:projectLabels
                                     blockTitles:blockTitles
                                    manualBlocks:manualBlocks
@@ -6283,6 +6325,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"更多"];
     NSArray *items = @[
         @[@"设置", NSStringFromSelector(@selector(openSettings:))],
+        @[@"应用写入映射", NSStringFromSelector(@selector(openAppWriteMappings:))],
         @[@"打开数据目录", NSStringFromSelector(@selector(openDataFolder:))],
         @[@"检查权限", NSStringFromSelector(@selector(requestPermission:))],
         @[@"退出", NSStringFromSelector(@selector(quit:))]
@@ -6408,6 +6451,159 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     }
 }
 
+- (NSArray<NSDictionary *> *)appWriteMappingRows {
+    NSDate *dashboardDate = [self dashboardDate];
+    NSArray *segments = ReadSegmentsForRange(self.store,
+                                             dashboardDate,
+                                             DateByAddingDays(dashboardDate, 1),
+                                             SameDay(dashboardDate, [NSDate date]) ? [self.tracker currentDashboardSegment] : nil);
+    NSDictionary *summary = AppSummaryFromSegments(segments);
+    NSArray *topApps = summary[@"top_apps"] ?: @[];
+    NSDictionary *existingMappings = [self appWriteMappingsByAppKey];
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *rowsByKey = [NSMutableDictionary dictionary];
+
+    for (NSDictionary *app in topApps) {
+        NSString *key = app[@"key"];
+        if (key.length == 0 || [key hasPrefix:@"__"]) {
+            continue;
+        }
+        rowsByKey[key] = [@{
+            @"key": key,
+            @"title": app[@"title"] ?: key,
+            @"bundle_id": app[@"bundle_id"] ?: @"",
+            @"seconds": app[@"seconds"] ?: @0
+        } mutableCopy];
+    }
+
+    for (NSString *key in existingMappings) {
+        if (key.length == 0) {
+            continue;
+        }
+        NSDictionary *mapping = existingMappings[key];
+        NSString *title = [mapping isKindOfClass:NSDictionary.class] && [mapping[@"event_title"] length] > 0 ? mapping[@"event_title"] : key;
+        if (!rowsByKey[key]) {
+            rowsByKey[key] = [@{
+                @"key": key,
+                @"title": title,
+                @"bundle_id": @"",
+                @"seconds": @0
+            } mutableCopy];
+        }
+    }
+
+    NSArray *rows = [rowsByKey.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        BOOL leftMapped = existingMappings[a[@"key"]] != nil;
+        BOOL rightMapped = existingMappings[b[@"key"]] != nil;
+        if (leftMapped != rightMapped) {
+            return leftMapped ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [b[@"seconds"] compare:a[@"seconds"]];
+    }];
+    return rows.count > 12 ? [rows subarrayWithRange:NSMakeRange(0, 12)] : rows;
+}
+
+- (NSTextField *)mappingTextFieldWithPlaceholder:(NSString *)placeholder value:(NSString *)value width:(CGFloat)width {
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, width, 24)];
+    field.font = [NSFont systemFontOfSize:12];
+    field.bezelStyle = NSTextFieldRoundedBezel;
+    field.placeholderString = placeholder ?: @"";
+    field.stringValue = value ?: @"";
+    return field;
+}
+
+- (void)openAppWriteMappings:(id)sender {
+    NSArray<NSDictionary *> *apps = [self appWriteMappingRows];
+    NSMutableDictionary *existingMappings = [[self appWriteMappingsByAppKey] mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (apps.count == 0) {
+        [self showAlertWithTitle:@"还没有可配置的应用"
+                         message:@"Gotowork 需要先记录到一些前台应用，才会在这里显示应用写入映射。"];
+        return;
+    }
+
+    NSMutableArray<NSDictionary *> *controls = [NSMutableArray array];
+    CGFloat rowHeight = 74.0;
+    CGFloat documentHeight = MAX(92.0, apps.count * rowHeight + 16.0);
+    NSView *document = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, documentHeight)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(10, 8, 520, documentHeight - 16)];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.spacing = 10;
+    stack.alignment = NSLayoutAttributeLeading;
+
+    for (NSDictionary *app in apps) {
+        NSString *key = app[@"key"] ?: @"";
+        NSString *title = app[@"title"] ?: key;
+        NSDictionary *mapping = existingMappings[key];
+        NSString *mappedTitle = [mapping isKindOfClass:NSDictionary.class] ? mapping[@"event_title"] : @"";
+        NSString *mappedProject = [mapping isKindOfClass:NSDictionary.class] ? mapping[@"project_title"] : @"";
+
+        NSStackView *row = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 520, 64)];
+        row.orientation = NSUserInterfaceLayoutOrientationVertical;
+        row.spacing = 5;
+
+        NSString *labelText = [NSString stringWithFormat:@"%@  %@", title, key];
+        NSTextField *label = [NSTextField labelWithString:labelText];
+        label.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+        label.textColor = [NSColor secondaryLabelColor];
+        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        label.frame = NSMakeRect(0, 0, 520, 16);
+
+        NSStackView *fields = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 520, 26)];
+        fields.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        fields.spacing = 8;
+        NSTextField *titleField = [self mappingTextFieldWithPlaceholder:title value:mappedTitle width:250];
+        NSTextField *projectField = [self mappingTextFieldWithPlaceholder:@"项目标签（可选）" value:mappedProject width:250];
+        [fields addArrangedSubview:titleField];
+        [fields addArrangedSubview:projectField];
+
+        [row addArrangedSubview:label];
+        [row addArrangedSubview:fields];
+        [stack addArrangedSubview:row];
+        [controls addObject:@{@"key": key, @"title": titleField, @"project": projectField}];
+    }
+
+    [document addSubview:stack];
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 560, 330)];
+    scroll.hasVerticalScroller = YES;
+    scroll.borderType = NSBezelBorder;
+    scroll.documentView = document;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"应用写入映射";
+    alert.informativeText = @"按应用设置默认日历标题和项目标签。单个时段手动编辑会优先于这里的默认映射；留空则使用原应用名或清除映射。";
+    alert.accessoryView = scroll;
+    [alert addButtonWithTitle:@"保存"];
+    [alert addButtonWithTitle:@"取消"];
+    [NSApp activateIgnoringOtherApps:YES];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    for (NSDictionary *row in controls) {
+        NSString *key = row[@"key"];
+        NSTextField *titleField = row[@"title"];
+        NSTextField *projectField = row[@"project"];
+        NSString *mappedTitle = TrimmedUserText(titleField.stringValue);
+        NSString *mappedProject = TrimmedUserText(projectField.stringValue);
+        if (mappedTitle.length == 0 && mappedProject.length == 0) {
+            [existingMappings removeObjectForKey:key];
+            continue;
+        }
+        NSMutableDictionary *mapping = [NSMutableDictionary dictionary];
+        if (mappedTitle.length > 0) {
+            mapping[@"event_title"] = mappedTitle;
+        }
+        if (mappedProject.length > 0) {
+            mapping[@"project_title"] = mappedProject;
+        }
+        existingMappings[key] = mapping;
+    }
+
+    [[NSUserDefaults standardUserDefaults] setObject:existingMappings forKey:AppWriteMappingsByKeyKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self updateStatus:@"应用写入映射已更新"];
+    [self refreshDashboard];
+}
+
 - (NSArray *)previewCalendarBlocks:(NSArray *)candidates {
     NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
     NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 360, 1)];
@@ -6509,6 +6705,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, [self manualCalendarBlockRecords], dashboardDate),
                                                       existingKeys,
                                                       ignoredKeys,
+                                                      [self appWriteMappingsByAppKey],
                                                       [self projectLabelsByBlockKey],
                                                       [self blockTitlesByBlockKey]);
     candidates = PendingCalendarCandidates(candidates, existingKeys, ignoredKeys);
@@ -6559,6 +6756,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, [self manualCalendarBlockRecords], dashboardDate),
                                                       existingKeys,
                                                       ignoredKeys,
+                                                      [self appWriteMappingsByAppKey],
                                                       [self projectLabelsByBlockKey],
                                                       [self blockTitlesByBlockKey]);
     if (candidates.count == 0) {
@@ -7140,6 +7338,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     RegisterDefaultSettings();
 
     SegmentStore *store = [[SegmentStore alloc] initWithDataDirectory:DefaultApplicationSupportDirectory()];
+    NSDictionary *appWriteMappings = [[NSUserDefaults standardUserDefaults] dictionaryForKey:AppWriteMappingsByKeyKey] ?: @{};
     NSDictionary *projectLabels = [[NSUserDefaults standardUserDefaults] dictionaryForKey:ProjectLabelsByBlockKeyKey] ?: @{};
     NSDictionary *blockTitles = [[NSUserDefaults standardUserDefaults] dictionaryForKey:BlockTitlesByBlockKeyKey] ?: @{};
     NSArray *manualBlocks = [[NSUserDefaults standardUserDefaults] arrayForKey:ManualCalendarBlocksKey] ?: @[];
@@ -7158,6 +7357,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
                                          nil,
                                          [NSSet set],
                                          [NSSet set],
+                                         appWriteMappings,
                                          projectLabels,
                                          blockTitles,
                                          manualBlocks);
@@ -7176,7 +7376,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
                                   app[@"title"] ?: @"未知",
                                   [app[@"ratio"] doubleValue] * 100.0]];
             }
-            printf("%s %s-%s kind=%s layer=%s key=%s title=%s mode=%s apps=%s\n",
+            printf("%s %s-%s kind=%s layer=%s key=%s title=%s event=%s project=%s mode=%s apps=%s\n",
                    [DayString(block[@"start"]) UTF8String],
                    start.UTF8String,
                    end.UTF8String,
@@ -7184,6 +7384,8 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
                    [block[@"visual_layer"] ?: @"" UTF8String],
                    [block[@"key"] ?: @"" UTF8String],
                    [block[@"title"] ?: @"" UTF8String],
+                   [CalendarEventTitleForBlock(block) UTF8String],
+                   [block[@"project_title"] ?: @"" UTF8String],
                    [block[@"mode"] ?: @"" UTF8String],
                    [[parts componentsJoinedByString:@","] UTF8String]);
         }
