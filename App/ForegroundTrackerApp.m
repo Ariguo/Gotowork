@@ -38,6 +38,8 @@ static NSString *DisplayTitle(NSString *title) {
 
 static NSString * const TrackerCalendarTitle = @"前台记录";
 static NSString * const GotoworkBundleIdentifier = @"com.ariguo.Gotowork";
+static NSString * const ResidentMeetingBundleIdentifier = @"com.electron.lark.iron";
+static NSString * const ResidentMeetingDisplayName = @"飞书会议";
 static NSString * const GeneratedEventMarkerPrefix = @"ForegroundTrackerGenerated";
 static NSString * const GeneratedBlockMarkerPrefix = @"ForegroundTrackerBlock";
 static NSString * const SettingIdleSecondsKey = @"idle_seconds";
@@ -213,12 +215,35 @@ static NSDictionary *CurrentSnapshot(double idleSeconds) {
     };
 }
 
+static NSDictionary *ResidentMeetingSnapshot(void) {
+    for (NSRunningApplication *app in [NSWorkspace sharedWorkspace].runningApplications) {
+        if (app.terminated || ![app.bundleIdentifier isEqualToString:ResidentMeetingBundleIdentifier]) {
+            continue;
+        }
+        pid_t pid = app.processIdentifier;
+        return @{
+            @"captured_at": [ISOFormatter() stringFromDate:[NSDate date]],
+            @"bundle_id": ResidentMeetingBundleIdentifier,
+            @"app_name": ResidentMeetingDisplayName,
+            @"executable_path": app.executableURL.path ?: @"",
+            @"pid": @(pid),
+            @"window_title": @"",
+            @"window_role": @"",
+            @"window_subrole": @"",
+            @"identity": ResidentMeetingBundleIdentifier
+        };
+    }
+    return nil;
+}
+
 @interface SegmentStore : NSObject
 @property(nonatomic, strong) NSURL *dataDirectory;
 - (instancetype)initWithDataDirectory:(NSURL *)dataDirectory;
 - (NSURL *)todayRawURL;
 - (NSURL *)rawURLForDate:(NSDate *)date;
+- (NSURL *)residentRawURLForDate:(NSDate *)date;
 - (BOOL)appendSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error;
+- (BOOL)appendResidentSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error;
 @end
 
 @implementation SegmentStore
@@ -240,13 +265,17 @@ static NSDictionary *CurrentSnapshot(double idleSeconds) {
     return [self.dataDirectory URLByAppendingPathComponent:name];
 }
 
-- (BOOL)appendSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error {
+- (NSURL *)residentRawURLForDate:(NSDate *)date {
+    NSString *name = [NSString stringWithFormat:@"resident_raw_%@.jsonl", DayString(date)];
+    return [self.dataDirectory URLByAppendingPathComponent:name];
+}
+
+- (BOOL)appendSegment:(NSDictionary *)segment toURL:(NSURL *)outputURL error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm createDirectoryAtURL:self.dataDirectory withIntermediateDirectories:YES attributes:nil error:error]) {
         return NO;
     }
 
-    NSURL *outputURL = [self rawURLForDate:startDate];
     if (![fm fileExistsAtPath:outputURL.path]) {
         if (![fm createFileAtPath:outputURL.path contents:nil attributes:nil]) {
             if (error) {
@@ -278,6 +307,14 @@ static NSDictionary *CurrentSnapshot(double idleSeconds) {
         return NO;
     }
 }
+
+- (BOOL)appendSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error {
+    return [self appendSegment:segment toURL:[self rawURLForDate:startDate] error:error];
+}
+
+- (BOOL)appendResidentSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error {
+    return [self appendSegment:segment toURL:[self residentRawURLForDate:startDate] error:error];
+}
 @end
 
 @class TrackerController;
@@ -286,6 +323,7 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
 @interface TrackerController : NSObject
 @property(nonatomic, strong) SegmentStore *store;
 @property(nonatomic, strong) NSMutableDictionary *current;
+@property(nonatomic, strong) NSMutableDictionary *residentMeeting;
 @property(nonatomic, strong) NSMutableDictionary *pendingTransition;
 @property(nonatomic, strong) NSTimer *pendingTransitionTimer;
 @property(nonatomic, strong) NSMutableArray *timers;
@@ -303,6 +341,9 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
 - (void)stopWithReason:(NSString *)reason;
 - (void)checkpointWithReason:(NSString *)reason;
 - (NSDictionary *)currentDashboardSegment;
+- (NSDictionary *)currentResidentMeetingSegment;
+- (void)sampleResidentMeetingAt:(NSDate *)now reason:(NSString *)reason;
+- (void)closeResidentMeetingAt:(NSDate *)proposedEnd reason:(NSString *)reason;
 @end
 
 @implementation TrackerController
@@ -346,11 +387,12 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
 }
 
 - (void)stopWithReason:(NSString *)reason {
-    if (!self.isRecording && !self.current) {
+    if (!self.isRecording && !self.current && !self.residentMeeting) {
         return;
     }
     [self clearPendingTransition];
     [self closeCurrentAt:[NSDate date] reason:reason];
+    [self closeResidentMeetingAt:[NSDate date] reason:reason];
     for (NSTimer *timer in self.timers) {
         [timer invalidate];
     }
@@ -377,6 +419,7 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
     }
     [self clearPendingTransition];
     [self closeCurrentAt:[NSDate date] reason:reason ?: @"checkpoint"];
+    [self closeResidentMeetingAt:[NSDate date] reason:reason ?: @"checkpoint"];
     [self sampleWithReason:@"checkpoint-resume"];
 }
 
@@ -406,6 +449,38 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
         @"window_subrole": snapshot[@"window_subrole"] ?: @"",
         @"sample_count": open[@"sample_count"] ?: @1,
         @"end_reason": @"ongoing",
+        @"__ongoing": @YES
+    };
+}
+
+- (NSDictionary *)currentResidentMeetingSegment {
+    if (!self.isRecording || !self.residentMeeting) {
+        return nil;
+    }
+    NSDictionary *open = [self.residentMeeting copy];
+    NSDictionary *snapshot = open[@"snapshot"];
+    NSDate *startAt = open[@"start_at"];
+    NSDate *endAt = [NSDate date];
+    double duration = MAX(0, [endAt timeIntervalSinceDate:startAt]);
+    if (duration <= MinimumRecordedSegmentSeconds()) {
+        return nil;
+    }
+    return @{
+        @"id": open[@"id"] ?: [NSUUID UUID].UUIDString,
+        @"start_at": [ISOFormatter() stringFromDate:startAt],
+        @"end_at": [ISOFormatter() stringFromDate:endAt],
+        @"duration_seconds": @(duration),
+        @"bundle_id": snapshot[@"bundle_id"] ?: ResidentMeetingBundleIdentifier,
+        @"app_name": snapshot[@"app_name"] ?: ResidentMeetingDisplayName,
+        @"executable_path": snapshot[@"executable_path"] ?: @"",
+        @"pid": snapshot[@"pid"] ?: @0,
+        @"window_title": snapshot[@"window_title"] ?: @"",
+        @"window_role": snapshot[@"window_role"] ?: @"",
+        @"window_subrole": snapshot[@"window_subrole"] ?: @"",
+        @"sample_count": open[@"sample_count"] ?: @1,
+        @"end_reason": @"ongoing",
+        @"resident": @YES,
+        @"resident_kind": @"meeting",
         @"__ongoing": @YES
     };
 }
@@ -477,6 +552,7 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
         self.isSleeping = YES;
         [self clearPendingTransition];
         [self closeCurrentAt:[NSDate date] reason:@"sleep"];
+        [self closeResidentMeetingAt:[NSDate date] reason:@"sleep"];
     }];
     [self.observerTokens addObject:token];
 
@@ -489,6 +565,7 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
     token = [center addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         [self clearPendingTransition];
         [self closeCurrentAt:[NSDate date] reason:@"screen-sleep"];
+        [self closeResidentMeetingAt:[NSDate date] reason:@"screen-sleep"];
     }];
     [self.observerTokens addObject:token];
 
@@ -497,6 +574,7 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
         self.isLocked = YES;
         [self clearPendingTransition];
         [self closeCurrentAt:[NSDate date] reason:@"screen-locked"];
+        [self closeResidentMeetingAt:[NSDate date] reason:@"screen-locked"];
     }];
     [self.observerTokens addObject:token];
 
@@ -538,6 +616,12 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
         return;
     }
     NSDate *now = [NSDate date];
+    if (self.isLocked || self.isSleeping) {
+        [self closeResidentMeetingAt:now reason:reason ?: @"inactive"];
+    } else {
+        [self sampleResidentMeetingAt:now reason:reason];
+    }
+
     double idle = IdleSeconds();
     NSDate *idleCutoff = [now dateByAddingTimeInterval:-MAX(0, idle - self.idleThreshold)];
     if (self.isLocked || self.isSleeping || idle >= self.idleThreshold) {
@@ -606,6 +690,69 @@ static void AXCallback(AXObserverRef observer, AXUIElementRef element, CFStringR
         @"reason": reason ?: @"switch"
     } mutableCopy];
     [self schedulePendingTransitionCheck];
+}
+
+- (void)sampleResidentMeetingAt:(NSDate *)now reason:(NSString *)reason {
+    NSDictionary *snapshot = ResidentMeetingSnapshot();
+    if (!snapshot) {
+        [self closeResidentMeetingAt:now reason:@"meeting-ended"];
+        return;
+    }
+
+    if (!self.residentMeeting) {
+        self.residentMeeting = [@{
+            @"id": [NSUUID UUID].UUIDString,
+            @"start_at": now,
+            @"last_seen_at": now,
+            @"sample_count": @1,
+            @"snapshot": snapshot,
+            @"identity": snapshot[@"identity"] ?: ResidentMeetingBundleIdentifier
+        } mutableCopy];
+        return;
+    }
+
+    self.residentMeeting[@"last_seen_at"] = now;
+    self.residentMeeting[@"sample_count"] = @([self.residentMeeting[@"sample_count"] integerValue] + 1);
+    self.residentMeeting[@"snapshot"] = snapshot;
+}
+
+- (void)closeResidentMeetingAt:(NSDate *)proposedEnd reason:(NSString *)reason {
+    if (!self.residentMeeting) {
+        return;
+    }
+    NSDictionary *open = [self.residentMeeting copy];
+    self.residentMeeting = nil;
+
+    NSDate *startAt = open[@"start_at"];
+    NSDate *endAt = [proposedEnd compare:startAt] == NSOrderedAscending ? startAt : proposedEnd;
+    double duration = [endAt timeIntervalSinceDate:startAt];
+    if (duration <= MinimumRecordedSegmentSeconds()) {
+        return;
+    }
+
+    NSDictionary *snapshot = open[@"snapshot"];
+    NSDictionary *segment = @{
+        @"id": open[@"id"],
+        @"start_at": [ISOFormatter() stringFromDate:startAt],
+        @"end_at": [ISOFormatter() stringFromDate:endAt],
+        @"duration_seconds": @(duration),
+        @"bundle_id": snapshot[@"bundle_id"] ?: ResidentMeetingBundleIdentifier,
+        @"app_name": snapshot[@"app_name"] ?: ResidentMeetingDisplayName,
+        @"executable_path": snapshot[@"executable_path"] ?: @"",
+        @"pid": snapshot[@"pid"] ?: @0,
+        @"window_title": snapshot[@"window_title"] ?: @"",
+        @"window_role": snapshot[@"window_role"] ?: @"",
+        @"window_subrole": snapshot[@"window_subrole"] ?: @"",
+        @"sample_count": open[@"sample_count"] ?: @1,
+        @"end_reason": reason ?: @"meeting-ended",
+        @"resident": @YES,
+        @"resident_kind": @"meeting"
+    };
+
+    NSError *error = nil;
+    if (![self.store appendResidentSegment:segment startDate:startAt error:&error]) {
+        [self emitStatus:[NSString stringWithFormat:@"Write failed: %@", error.localizedDescription]];
+    }
 }
 
 - (void)closeCurrentAt:(NSDate *)proposedEnd reason:(NSString *)reason {
@@ -1334,6 +1481,21 @@ static NSString *DashboardDateSubtitle(NSDate *date) {
     return [formatter stringFromDate:CalendarStartOfDay(date)];
 }
 
+static void AddOpenSegmentIfInRange(NSMutableArray<NSMutableDictionary *> *segments,
+                                    NSDictionary *openSegment,
+                                    NSDate *startInclusive,
+                                    NSDate *endExclusive) {
+    if (!openSegment) {
+        return;
+    }
+    NSMutableDictionary *open = [openSegment mutableCopy];
+    if (DecorateSegment(open) &&
+        [open[@"__start"] compare:startInclusive] != NSOrderedAscending &&
+        [open[@"__start"] compare:endExclusive] == NSOrderedAscending) {
+        [segments addObject:open];
+    }
+}
+
 static NSMutableArray<NSMutableDictionary *> *ReadSegmentsForRange(SegmentStore *store,
                                                                     NSDate *startInclusive,
                                                                     NSDate *endExclusive,
@@ -1346,14 +1508,27 @@ static NSMutableArray<NSMutableDictionary *> *ReadSegmentsForRange(SegmentStore 
         day = DateByAddingDays(day, 1);
     }
 
-    if (openSegment) {
-        NSMutableDictionary *open = [openSegment mutableCopy];
-        if (DecorateSegment(open) &&
-            [open[@"__start"] compare:startInclusive] != NSOrderedAscending &&
-            [open[@"__start"] compare:endExclusive] == NSOrderedAscending) {
-            [segments addObject:open];
-        }
+    AddOpenSegmentIfInRange(segments, openSegment, startInclusive, endExclusive);
+
+    [segments sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"__start"] compare:b[@"__start"]];
+    }];
+    return segments;
+}
+
+static NSMutableArray<NSMutableDictionary *> *ReadResidentSegmentsForRange(SegmentStore *store,
+                                                                            NSDate *startInclusive,
+                                                                            NSDate *endExclusive,
+                                                                            NSDictionary *openSegment) {
+    NSMutableArray<NSMutableDictionary *> *segments = [NSMutableArray array];
+    NSDate *day = CalendarStartOfDay(startInclusive);
+    NSDate *end = CalendarStartOfDay(endExclusive);
+    while ([day compare:end] == NSOrderedAscending) {
+        [segments addObjectsFromArray:ReadRawSegments([store residentRawURLForDate:day])];
+        day = DateByAddingDays(day, 1);
     }
+
+    AddOpenSegmentIfInRange(segments, openSegment, startInclusive, endExclusive);
 
     [segments sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"__start"] compare:b[@"__start"]];
@@ -1846,7 +2021,12 @@ static NSString *CalendarBlockKeyForDates(NSDate *start, NSDate *end) {
 }
 
 static NSString *CalendarBlockKeyForBlock(NSDictionary *block) {
-    return CalendarBlockKeyForDates(block[@"start"], block[@"end"]);
+    NSString *base = CalendarBlockKeyForDates(block[@"start"], block[@"end"]);
+    if (base.length > 0 && [block[@"resident"] boolValue]) {
+        NSString *suffix = block[@"key"] ?: block[@"resident_kind"] ?: @"resident";
+        return [base stringByAppendingFormat:@"-%@", suffix];
+    }
+    return base;
 }
 
 static NSString *TrimmedUserText(NSString *value) {
@@ -2009,10 +2189,87 @@ static NSArray *ManualCalendarCandidatesFromRecords(NSArray *records,
     return manualCandidates;
 }
 
+static NSMutableDictionary *ResidentMeetingCandidate(NSDate *start, NSDate *end) {
+    return [@{
+        @"start": start,
+        @"end": end,
+        @"key": ResidentMeetingBundleIdentifier,
+        @"bundle_id": ResidentMeetingBundleIdentifier,
+        @"title": ResidentMeetingDisplayName,
+        @"event_title": ResidentMeetingDisplayName,
+        @"kind": @"app",
+        @"mode": @"常驻",
+        @"resident": @YES,
+        @"resident_kind": @"meeting"
+    } mutableCopy];
+}
+
+static void AddResidentMeetingCandidateIfEligible(NSMutableArray *blocks,
+                                                  NSMutableDictionary *block,
+                                                  double minDuration) {
+    if (!block) {
+        return;
+    }
+    NSDate *start = block[@"start"];
+    NSDate *end = block[@"end"];
+    double wall = [end timeIntervalSinceDate:start];
+    if (wall < minDuration) {
+        return;
+    }
+    block[@"wall_seconds"] = @(wall);
+    block[@"active_seconds"] = @(wall);
+    block[@"observed_seconds"] = @(wall);
+    block[@"active_ratio"] = @1.0;
+    block[@"top_apps"] = @[@{
+        @"title": ResidentMeetingDisplayName,
+        @"key": ResidentMeetingBundleIdentifier,
+        @"bundle_id": ResidentMeetingBundleIdentifier,
+        @"seconds": @(wall),
+        @"ratio": @1.0
+    }];
+    [blocks addObject:block];
+}
+
+static NSArray *ResidentMeetingCandidatesFromSegments(NSArray<NSMutableDictionary *> *residentSegments) {
+    if (residentSegments.count == 0) {
+        return @[];
+    }
+
+    NSMutableArray *blocks = [NSMutableArray array];
+    NSMutableDictionary *current = nil;
+    NSTimeInterval mergeGap = MAX(5.0, MinimumRecordedSegmentSeconds());
+    for (NSDictionary *segment in residentSegments) {
+        BOOL isMeeting = [segment[@"resident_kind"] isEqualToString:@"meeting"] ||
+                         [segment[@"bundle_id"] isEqualToString:ResidentMeetingBundleIdentifier];
+        if (!isMeeting) {
+            continue;
+        }
+        NSDate *start = segment[@"__start"];
+        NSDate *end = segment[@"__end"];
+        if (!start || !end || [end timeIntervalSinceDate:start] <= MinimumRecordedSegmentSeconds()) {
+            continue;
+        }
+
+        if (current) {
+            double gap = [start timeIntervalSinceDate:current[@"end"]];
+            if (gap >= -0.001 && gap <= mergeGap) {
+                current[@"end"] = [end compare:current[@"end"]] == NSOrderedDescending ? end : current[@"end"];
+                continue;
+            }
+            AddResidentMeetingCandidateIfEligible(blocks, current, CalendarMinBlockSecondsSetting());
+        }
+        current = ResidentMeetingCandidate(start, end);
+    }
+    AddResidentMeetingCandidateIfEligible(blocks, current, CalendarMinBlockSecondsSetting());
+    return blocks;
+}
+
 static NSArray *CalendarCandidatesIncludingManual(NSArray<NSMutableDictionary *> *segments,
+                                                  NSArray<NSMutableDictionary *> *residentSegments,
                                                   NSArray *manualRecords,
                                                   NSDate *day) {
     NSMutableArray *candidates = [CalendarCandidatesFromSegments(segments ?: @[]) mutableCopy] ?: [NSMutableArray array];
+    [candidates addObjectsFromArray:ResidentMeetingCandidatesFromSegments(residentSegments ?: @[])];
     [candidates addObjectsFromArray:ManualCalendarCandidatesFromRecords(manualRecords, segments ?: @[], day ?: [NSDate date])];
     [candidates sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         NSComparisonResult result = [a[@"start"] compare:b[@"start"]];
@@ -2117,6 +2374,7 @@ static NSArray *VisualBlocksFromSegments(NSArray<NSMutableDictionary *> *segment
 static NSDictionary *DashboardStats(SegmentStore *store,
                                     NSDate *displayDate,
                                     NSDictionary *openSegment,
+                                    NSDictionary *openResidentSegment,
                                     NSSet<NSString *> *existingCalendarKeys,
                                     NSSet<NSString *> *ignoredCalendarKeys,
                                     NSDictionary<NSString *, NSDictionary *> *appWriteMappings,
@@ -2130,6 +2388,7 @@ static NSDictionary *DashboardStats(SegmentStore *store,
     BOOL selectedIsToday = SameDay(selectedStart, todayStart);
     NSDate *visibleRangeEnd = selectedIsToday ? [NSDate date] : selectedEnd;
     NSMutableArray<NSMutableDictionary *> *segments = [ReadSegmentsForRange(store, selectedStart, selectedEnd, selectedIsToday ? openSegment : nil) mutableCopy];
+    NSMutableArray<NSMutableDictionary *> *residentSegments = [ReadResidentSegmentsForRange(store, selectedStart, selectedEnd, selectedIsToday ? openResidentSegment : nil) mutableCopy];
 
     NSDate *start = nil;
     NSDate *end = nil;
@@ -2164,7 +2423,7 @@ static NSDictionary *DashboardStats(SegmentStore *store,
         ScopeSummary(@"本月", monthStart, monthEnd, monthSegments)
     ];
 
-    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, manualRecords, selectedStart),
+    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, residentSegments, manualRecords, selectedStart),
                                                       existingCalendarKeys ?: [NSSet set],
                                                       ignoredCalendarKeys ?: [NSSet set],
                                                       appWriteMappings ?: @{},
@@ -2188,6 +2447,7 @@ static NSDictionary *DashboardStats(SegmentStore *store,
     NSArray *projectLabelList = [projectSet.allObjects sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
     return @{
         @"segments": segments,
+        @"resident_segments": residentSegments,
         @"top_apps": topApps,
         @"recent": recent,
         @"candidates": candidates,
@@ -2197,7 +2457,9 @@ static NSDictionary *DashboardStats(SegmentStore *store,
         @"pending_candidate_count": @(PendingCalendarCandidateCount(candidates)),
         @"confirmed_candidate_count": @(ConfirmedCalendarCandidateCount(candidates)),
         @"total_seconds": todaySummary[@"total_seconds"] ?: @0,
-        @"segment_count": @(segments.count),
+        @"segment_count": @(segments.count + residentSegments.count),
+        @"foreground_segment_count": @(segments.count),
+        @"resident_segment_count": @(residentSegments.count),
         @"display_date": selectedStart,
         @"date_title": DashboardDateTitle(selectedStart),
         @"date_subtitle": DashboardDateSubtitle(selectedStart),
@@ -6005,6 +6267,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 - (void)refreshWithStore:(SegmentStore *)store
              displayDate:(NSDate *)displayDate
              openSegment:(NSDictionary *)openSegment
+      openResidentSegment:(NSDictionary *)openResidentSegment
      existingCalendarKeys:(NSSet<NSString *> *)existingCalendarKeys
      ignoredCalendarKeys:(NSSet<NSString *> *)ignoredCalendarKeys
 	    appWriteMappings:(NSDictionary<NSString *, NSDictionary *> *)appWriteMappings
@@ -6056,6 +6319,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 - (void)refreshWithStore:(SegmentStore *)store
              displayDate:(NSDate *)displayDate
              openSegment:(NSDictionary *)openSegment
+      openResidentSegment:(NSDictionary *)openResidentSegment
      existingCalendarKeys:(NSSet<NSString *> *)existingCalendarKeys
      ignoredCalendarKeys:(NSSet<NSString *> *)ignoredCalendarKeys
 	    appWriteMappings:(NSDictionary<NSString *, NSDictionary *> *)appWriteMappings
@@ -6068,6 +6332,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSDictionary *stats = DashboardStats(store,
                                          displayDate,
                                          openSegment,
+                                         openResidentSegment,
                                          existingCalendarKeys,
                                          ignoredCalendarKeys,
                                          appWriteMappings,
@@ -6322,6 +6587,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     [self.dashboardController refreshWithStore:self.store
                                    displayDate:dashboardDate
                                    openSegment:[self.tracker currentDashboardSegment]
+                           openResidentSegment:[self.tracker currentResidentMeetingSegment]
                             existingCalendarKeys:existingKeys
                              ignoredCalendarKeys:ignoredKeys
 	                          appWriteMappings:appWriteMappings
@@ -6565,11 +6831,16 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 
 - (NSArray<NSDictionary *> *)appWriteMappingRows {
     NSDate *dashboardDate = [self dashboardDate];
+    BOOL selectedIsToday = SameDay(dashboardDate, [NSDate date]);
     NSArray *segments = ReadSegmentsForRange(self.store,
                                              dashboardDate,
                                              DateByAddingDays(dashboardDate, 1),
-                                             SameDay(dashboardDate, [NSDate date]) ? [self.tracker currentDashboardSegment] : nil);
-    NSDictionary *summary = AppSummaryFromSegments(segments);
+                                             selectedIsToday ? [self.tracker currentDashboardSegment] : nil);
+    NSArray *residentSegments = ReadResidentSegmentsForRange(self.store,
+                                                             dashboardDate,
+                                                             DateByAddingDays(dashboardDate, 1),
+                                                             selectedIsToday ? [self.tracker currentResidentMeetingSegment] : nil);
+    NSDictionary *summary = AppSummaryFromSegments([segments arrayByAddingObjectsFromArray:residentSegments]);
     NSArray *topApps = summary[@"top_apps"] ?: @[];
     NSDictionary *existingMappings = [self appWriteMappingsByAppKey];
     NSMutableDictionary<NSString *, NSMutableDictionary *> *rowsByKey = [NSMutableDictionary dictionary];
@@ -6811,10 +7082,12 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     if (SameDay(dashboardDate, [NSDate date])) {
         [self.tracker checkpointWithReason:@"calendar-export"];
     }
-    NSArray *segments = ReadSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), SameDay(dashboardDate, [NSDate date]) ? [self.tracker currentDashboardSegment] : nil);
+    BOOL selectedIsToday = SameDay(dashboardDate, [NSDate date]);
+    NSArray *segments = ReadSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), selectedIsToday ? [self.tracker currentDashboardSegment] : nil);
+    NSArray *residentSegments = ReadResidentSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), selectedIsToday ? [self.tracker currentResidentMeetingSegment] : nil);
     NSSet<NSString *> *existingKeys = [self existingCalendarBlockKeysForDay:dashboardDate];
     NSSet<NSString *> *ignoredKeys = [self ignoredCalendarBlockKeys];
-    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, [self manualCalendarBlockRecords], dashboardDate),
+    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, residentSegments, [self manualCalendarBlockRecords], dashboardDate),
                                                       existingKeys,
                                                       ignoredKeys,
                                                       [self appWriteMappingsByAppKey],
@@ -6862,10 +7135,12 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     if (SameDay(dashboardDate, [NSDate date])) {
         [self.tracker checkpointWithReason:@"calendar-export"];
     }
-    NSArray *segments = ReadSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), SameDay(dashboardDate, [NSDate date]) ? [self.tracker currentDashboardSegment] : nil);
+    BOOL selectedIsToday = SameDay(dashboardDate, [NSDate date]);
+    NSArray *segments = ReadSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), selectedIsToday ? [self.tracker currentDashboardSegment] : nil);
+    NSArray *residentSegments = ReadResidentSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), selectedIsToday ? [self.tracker currentResidentMeetingSegment] : nil);
     NSSet<NSString *> *existingKeys = [self existingCalendarBlockKeysForDay:dashboardDate];
     NSSet<NSString *> *ignoredKeys = [self ignoredCalendarBlockKeys];
-    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, [self manualCalendarBlockRecords], dashboardDate),
+    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, residentSegments, [self manualCalendarBlockRecords], dashboardDate),
                                                       existingKeys,
                                                       ignoredKeys,
                                                       [self appWriteMappingsByAppKey],
@@ -7480,6 +7755,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     }
     NSDictionary *stats = DashboardStats(store,
                                          previewDate,
+                                         nil,
                                          nil,
                                          [NSSet set],
                                          [NSSet set],
