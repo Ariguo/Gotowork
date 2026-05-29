@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Build outputs
+.build/
+dist/
+
+# Local runtime data
+data/
+records/
+logs/
+*.log
+*.pid
+
+# Local databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local exports and scratch files
+*.ics
+*.csv
+*.jsonl
+tmp/
+temp/

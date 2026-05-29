@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>ForegroundTracker</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.ariguo.Gotowork</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Gotowork</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Local foreground-window recorder.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>用于把前台应用记录手动生成到 Apple 日历。</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>用于创建“前台记录”日历，并更新今天由本应用生成的事件以避免重复。</string>
+	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
+	<string>用于把前台应用记录手动生成到 Apple 日历。</string>
+</dict>
+</plist>
