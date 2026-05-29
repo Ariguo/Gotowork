@@ -44,6 +44,7 @@ static NSString * const GeneratedEventMarkerPrefix = @"ForegroundTrackerGenerate
 static NSString * const GeneratedBlockMarkerPrefix = @"ForegroundTrackerBlock";
 static NSString * const SettingIdleSecondsKey = @"idle_seconds";
 static NSString * const SettingShortInterruptionSecondsKey = @"short_interruption_seconds";
+static NSString * const SettingRawMergeInterruptionSecondsKey = @"raw_merge_interruption_seconds";
 static NSString * const SettingCalendarWindowMinutesKey = @"calendar_window_minutes";
 static NSString * const SettingCalendarMinBlockMinutesKey = @"calendar_min_block_minutes";
 static NSString * const TargetCalendarIdentifierKey = @"target_calendar_identifier";
@@ -62,6 +63,7 @@ static void RegisterDefaultSettings(void) {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         SettingIdleSecondsKey: @120.0,
         SettingShortInterruptionSecondsKey: @30.0,
+        SettingRawMergeInterruptionSecondsKey: @2.0,
         SettingCalendarWindowMinutesKey: @3.0,
         SettingCalendarMinBlockMinutesKey: @5.0
     }];
@@ -78,6 +80,10 @@ static NSTimeInterval IdleThresholdSetting(void) {
 
 static NSTimeInterval ShortInterruptionSetting(void) {
     return SettingDouble(SettingShortInterruptionSecondsKey, 30.0);
+}
+
+static NSTimeInterval RawMergeInterruptionSetting(void) {
+    return SettingDouble(SettingRawMergeInterruptionSecondsKey, 2.0);
 }
 
 static NSTimeInterval CalendarWindowSecondsSetting(void) {
@@ -236,12 +242,112 @@ static NSDictionary *ResidentMeetingSnapshot(void) {
     return nil;
 }
 
+static NSDate *RawSegmentDate(NSDictionary *segment, NSString *key) {
+    id value = segment[key];
+    if ([value isKindOfClass:NSDate.class]) {
+        return value;
+    }
+    if (![value isKindOfClass:NSString.class]) {
+        return nil;
+    }
+    return [ISOFormatter() dateFromString:value];
+}
+
+static double RawSegmentDuration(NSDictionary *segment) {
+    double duration = [segment[@"duration_seconds"] doubleValue];
+    if (duration > 0) {
+        return duration;
+    }
+    NSDate *start = RawSegmentDate(segment, @"start_at");
+    NSDate *end = RawSegmentDate(segment, @"end_at");
+    return start && end ? [end timeIntervalSinceDate:start] : 0;
+}
+
+static NSString *RawSegmentMergeIdentity(NSDictionary *segment) {
+    NSString *bundleID = segment[@"bundle_id"] ?: @"";
+    NSString *appName = segment[@"app_name"] ?: @"";
+    NSString *key = bundleID.length > 0 ? bundleID : appName;
+    if (key.length == 0) {
+        return @"";
+    }
+    if (IsBrowserBundle(bundleID)) {
+        return key;
+    }
+    return [NSString stringWithFormat:@"%@\t%@", key, segment[@"window_title"] ?: @""];
+}
+
+static BOOL RawSegmentEndReasonIsBoundary(NSString *reason) {
+    if (reason.length == 0) {
+        return NO;
+    }
+    return [reason isEqualToString:@"idle"] ||
+           [reason containsString:@"sleep"] ||
+           [reason containsString:@"locked"] ||
+           [reason isEqualToString:@"no-frontmost-window"] ||
+           [reason isEqualToString:@"app-terminate"] ||
+           [reason isEqualToString:@"quit"] ||
+           [reason isEqualToString:@"dealloc"];
+}
+
+static BOOL RawSegmentsTouch(NSDictionary *left, NSDictionary *right) {
+    NSDate *leftEnd = RawSegmentDate(left, @"end_at");
+    NSDate *rightStart = RawSegmentDate(right, @"start_at");
+    if (!leftEnd || !rightStart) {
+        return NO;
+    }
+    double gap = [rightStart timeIntervalSinceDate:leftEnd];
+    return gap >= -0.5 && gap <= 5.0;
+}
+
+static BOOL CanAbsorbRawInterruption(NSDictionary *previous,
+                                     NSDictionary *interruption,
+                                     NSDictionary *next) {
+    if ([interruption[@"resident"] boolValue] || [previous[@"resident"] boolValue] || [next[@"resident"] boolValue]) {
+        return NO;
+    }
+    NSString *previousIdentity = RawSegmentMergeIdentity(previous);
+    NSString *nextIdentity = RawSegmentMergeIdentity(next);
+    if (previousIdentity.length == 0 || ![previousIdentity isEqualToString:nextIdentity]) {
+        return NO;
+    }
+    if (RawSegmentEndReasonIsBoundary(interruption[@"end_reason"])) {
+        return NO;
+    }
+    double duration = RawSegmentDuration(interruption);
+    if (duration <= 0 || duration > RawMergeInterruptionSetting()) {
+        return NO;
+    }
+    return RawSegmentsTouch(previous, interruption) && RawSegmentsTouch(interruption, next);
+}
+
+static void AbsorbRawInterruptionIntoPrevious(NSMutableDictionary *previous,
+                                              NSDictionary *interruption,
+                                              NSDictionary *next) {
+    NSDate *start = RawSegmentDate(previous, @"start_at");
+    NSDate *end = RawSegmentDate(next, @"end_at");
+    if (!start || !end) {
+        return;
+    }
+    previous[@"end_at"] = next[@"end_at"];
+    previous[@"duration_seconds"] = @([end timeIntervalSinceDate:start]);
+    previous[@"sample_count"] = @([previous[@"sample_count"] integerValue] + [next[@"sample_count"] integerValue]);
+    previous[@"end_reason"] = next[@"end_reason"] ?: previous[@"end_reason"] ?: @"merged-short-interruption";
+    previous[@"absorbed_short_interruption_count"] = @([previous[@"absorbed_short_interruption_count"] integerValue] +
+                                                       [interruption[@"absorbed_short_interruption_count"] integerValue] +
+                                                       [next[@"absorbed_short_interruption_count"] integerValue] + 1);
+    previous[@"absorbed_short_interruption_seconds"] = @([previous[@"absorbed_short_interruption_seconds"] doubleValue] +
+                                                         [interruption[@"absorbed_short_interruption_seconds"] doubleValue] +
+                                                         [next[@"absorbed_short_interruption_seconds"] doubleValue] +
+                                                         RawSegmentDuration(interruption));
+}
+
 @interface SegmentStore : NSObject
 @property(nonatomic, strong) NSURL *dataDirectory;
 - (instancetype)initWithDataDirectory:(NSURL *)dataDirectory;
 - (NSURL *)todayRawURL;
 - (NSURL *)rawURLForDate:(NSDate *)date;
 - (NSURL *)residentRawURLForDate:(NSDate *)date;
+- (BOOL)compactRawURLForDate:(NSDate *)date error:(NSError **)error;
 - (BOOL)appendSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error;
 - (BOOL)appendResidentSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error;
 @end
@@ -308,8 +414,75 @@ static NSDictionary *ResidentMeetingSnapshot(void) {
     }
 }
 
+- (BOOL)compactRawURL:(NSURL *)rawURL error:(NSError **)error {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:rawURL.path]) {
+        return YES;
+    }
+    NSString *body = [NSString stringWithContentsOfURL:rawURL encoding:NSUTF8StringEncoding error:error];
+    if (!body) {
+        return NO;
+    }
+    if (body.length == 0) {
+        return YES;
+    }
+
+    NSMutableArray<NSMutableDictionary *> *compacted = [NSMutableArray array];
+    BOOL changed = NO;
+    for (NSString *line in [body componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        if (line.length == 0) {
+            continue;
+        }
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSMutableDictionary *segment = [[NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:error] mutableCopy];
+        if (![segment isKindOfClass:NSDictionary.class]) {
+            return NO;
+        }
+        [compacted addObject:segment];
+
+        while (compacted.count >= 3) {
+            NSUInteger count = compacted.count;
+            NSMutableDictionary *previous = compacted[count - 3];
+            NSDictionary *interruption = compacted[count - 2];
+            NSDictionary *next = compacted[count - 1];
+            if (!CanAbsorbRawInterruption(previous, interruption, next)) {
+                break;
+            }
+            AbsorbRawInterruptionIntoPrevious(previous, interruption, next);
+            [compacted removeLastObject];
+            [compacted removeLastObject];
+            changed = YES;
+        }
+    }
+
+    if (!changed) {
+        return YES;
+    }
+
+    NSMutableString *output = [NSMutableString string];
+    for (NSDictionary *segment in compacted) {
+        NSData *data = [NSJSONSerialization dataWithJSONObject:segment options:NSJSONWritingSortedKeys error:error];
+        if (!data) {
+            return NO;
+        }
+        NSString *line = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (line.length == 0) {
+            continue;
+        }
+        [output appendString:line];
+        [output appendString:@"\n"];
+    }
+    return [output writeToURL:rawURL atomically:YES encoding:NSUTF8StringEncoding error:error];
+}
+
+- (BOOL)compactRawURLForDate:(NSDate *)date error:(NSError **)error {
+    return [self compactRawURL:[self rawURLForDate:date] error:error];
+}
+
 - (BOOL)appendSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error {
-    return [self appendSegment:segment toURL:[self rawURLForDate:startDate] error:error];
+    if (![self appendSegment:segment toURL:[self rawURLForDate:startDate] error:error]) {
+        return NO;
+    }
+    return [self compactRawURLForDate:startDate error:error];
 }
 
 - (BOOL)appendResidentSegment:(NSDictionary *)segment startDate:(NSDate *)startDate error:(NSError **)error {
@@ -7657,6 +7830,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     NSString *previewNowClock = nil;
     CGFloat previewWidth = 1160.0;
     CGFloat previewHeight = 760.0;
+    BOOL compactRaw = NO;
     BOOL dark = NO;
     BOOL dumpBlocks = NO;
     BOOL selectFirstCalendar = NO;
@@ -7679,6 +7853,8 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             dark = YES;
         } else if ([arg isEqualToString:@"--dump-dashboard-blocks"]) {
             dumpBlocks = YES;
+        } else if ([arg isEqualToString:@"--compact-raw"]) {
+            compactRaw = YES;
         } else if ([arg isEqualToString:@"--highlight-app"] && i + 1 < argc) {
             highlightAppKey = [NSString stringWithUTF8String:argv[++i]];
         } else if ([arg isEqualToString:@"--select-first-calendar"]) {
@@ -7728,7 +7904,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             }
         }
     }
-    if (outputPath.length == 0 && !dumpBlocks) {
+    if (outputPath.length == 0 && !dumpBlocks && !compactRaw) {
         return -1;
     }
 
@@ -7749,6 +7925,15 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
         formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
         formatter.dateFormat = @"yyyy-MM-dd";
         previewDate = [formatter dateFromString:dateString] ?: previewDate;
+    }
+    if (compactRaw) {
+        NSError *compactError = nil;
+        if (![store compactRawURLForDate:previewDate error:&compactError]) {
+            fprintf(stderr, "failed to compact raw: %s\n", (compactError.localizedDescription ?: @"unknown").UTF8String);
+            return 2;
+        }
+        printf("%s\n", [[store rawURLForDate:previewDate].path UTF8String]);
+        return 0;
     }
     if (previewNowClock.length > 0) {
         DashboardNowOverride = DateOnDayFromClockText(previewDate, previewNowClock);
