@@ -2219,7 +2219,7 @@ static NSString *CalendarEventTitleForBlock(NSDictionary *block) {
         return @"混合工作";
     }
     NSString *title = block[@"title"] ?: @"未知应用";
-    return [NSString stringWithFormat:@"在用%@", title];
+    return title;
 }
 
 static NSString *CalendarNotesForBlock(NSDictionary *block) {
