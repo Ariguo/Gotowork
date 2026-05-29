@@ -44,6 +44,7 @@ static NSString * const SettingIdleSecondsKey = @"idle_seconds";
 static NSString * const SettingShortInterruptionSecondsKey = @"short_interruption_seconds";
 static NSString * const SettingCalendarWindowMinutesKey = @"calendar_window_minutes";
 static NSString * const SettingCalendarMinBlockMinutesKey = @"calendar_min_block_minutes";
+static NSString * const TargetCalendarIdentifierKey = @"target_calendar_identifier";
 static NSString * const IgnoredCalendarBlockKeysKey = @"ignored_calendar_block_keys";
 static NSString * const ProjectLabelsByBlockKeyKey = @"project_labels_by_block_key";
 static NSString * const BlockTitlesByBlockKeyKey = @"block_titles_by_block_key";
@@ -6193,11 +6194,59 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     return nil;
 }
 
+- (NSString *)targetCalendarIdentifier {
+    NSString *identifier = [[NSUserDefaults standardUserDefaults] stringForKey:TargetCalendarIdentifierKey];
+    return identifier.length > 0 ? identifier : @"";
+}
+
+- (NSArray<EKCalendar *> *)writableEventCalendars {
+    NSArray *calendars = [self.eventStore calendarsForEntityType:EKEntityTypeEvent];
+    NSMutableArray<EKCalendar *> *writable = [NSMutableArray array];
+    for (EKCalendar *calendar in calendars) {
+        if (!calendar.allowsContentModifications) {
+            continue;
+        }
+        [writable addObject:calendar];
+    }
+    [writable sortUsingComparator:^NSComparisonResult(EKCalendar *left, EKCalendar *right) {
+        NSComparisonResult titleOrder = [left.title localizedCaseInsensitiveCompare:right.title];
+        if (titleOrder != NSOrderedSame) {
+            return titleOrder;
+        }
+        return [(left.source.title ?: @"") localizedCaseInsensitiveCompare:(right.source.title ?: @"")];
+    }];
+    return writable;
+}
+
+- (EKCalendar *)selectedExistingCalendar {
+    NSString *identifier = [self targetCalendarIdentifier];
+    if (identifier.length == 0) {
+        return nil;
+    }
+    EKCalendar *calendar = [self.eventStore calendarWithIdentifier:identifier];
+    if (!calendar || !calendar.allowsContentModifications) {
+        return nil;
+    }
+    return calendar;
+}
+
+- (EKCalendar *)existingTargetCalendar {
+    if ([self targetCalendarIdentifier].length > 0) {
+        return [self selectedExistingCalendar];
+    }
+    return [self existingTrackerCalendar];
+}
+
+- (NSString *)targetCalendarDisplayTitle {
+    EKCalendar *selected = [self selectedExistingCalendar];
+    return selected.title.length > 0 ? selected.title : TrackerCalendarTitle;
+}
+
 - (NSSet<NSString *> *)existingCalendarBlockKeysForDay:(NSDate *)day {
     if (!CalendarStatusAllowsFullAccess([EKEventStore authorizationStatusForEntityType:EKEntityTypeEvent])) {
         return [NSSet set];
     }
-    EKCalendar *calendar = [self existingTrackerCalendar];
+    EKCalendar *calendar = [self existingTargetCalendar];
     if (!calendar) {
         return [NSSet set];
     }
@@ -6325,6 +6374,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"更多"];
     NSArray *items = @[
         @[@"设置", NSStringFromSelector(@selector(openSettings:))],
+        @[@"写入日历", NSStringFromSelector(@selector(openCalendarSettings:))],
         @[@"应用写入映射", NSStringFromSelector(@selector(openAppWriteMappings:))],
         @[@"打开数据目录", NSStringFromSelector(@selector(openDataFolder:))],
         @[@"检查权限", NSStringFromSelector(@selector(requestPermission:))],
@@ -6449,6 +6499,68 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     if (self.popover.isShown) {
         [self refreshDashboard];
     }
+}
+
+- (NSString *)calendarPopupTitleForCalendar:(EKCalendar *)calendar {
+    NSString *source = calendar.source.title ?: @"";
+    if (source.length == 0) {
+        return calendar.title ?: @"未命名日历";
+    }
+    return [NSString stringWithFormat:@"%@ · %@", calendar.title ?: @"未命名日历", source];
+}
+
+- (void)presentCalendarSettings {
+    NSString *currentIdentifier = [self targetCalendarIdentifier];
+    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 360, 28) pullsDown:NO];
+    [popup addItemWithTitle:[NSString stringWithFormat:@"使用或新建“%@”", TrackerCalendarTitle]];
+    popup.itemArray.lastObject.representedObject = @"";
+    NSInteger selectedIndex = 0;
+
+    for (EKCalendar *calendar in [self writableEventCalendars]) {
+        NSString *identifier = calendar.calendarIdentifier ?: @"";
+        if (identifier.length == 0) {
+            continue;
+        }
+        [popup addItemWithTitle:[self calendarPopupTitleForCalendar:calendar]];
+        popup.itemArray.lastObject.representedObject = identifier;
+        if (currentIdentifier.length > 0 && [identifier isEqualToString:currentIdentifier]) {
+            selectedIndex = popup.numberOfItems - 1;
+        }
+    }
+    [popup selectItemAtIndex:selectedIndex];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"写入日历";
+    alert.informativeText = @"默认会使用或创建“前台记录”日历；也可以选择一个已有可写日历。重复检测只会检查当前选中的写入日历。";
+    alert.accessoryView = popup;
+    [alert addButtonWithTitle:@"保存"];
+    [alert addButtonWithTitle:@"取消"];
+    [NSApp activateIgnoringOtherApps:YES];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    NSString *identifier = popup.selectedItem.representedObject;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (identifier.length > 0) {
+        [defaults setObject:identifier forKey:TargetCalendarIdentifierKey];
+    } else {
+        [defaults removeObjectForKey:TargetCalendarIdentifierKey];
+    }
+    [defaults synchronize];
+    [self updateStatus:[NSString stringWithFormat:@"写入日历：%@", [self targetCalendarDisplayTitle]]];
+    [self refreshDashboard];
+}
+
+- (void)openCalendarSettings:(id)sender {
+    [self requestCalendarAccessWithCompletion:^(BOOL granted, NSError *error) {
+        if (!granted) {
+            [self showAlertWithTitle:@"没拿到日历权限"
+                             message:error.localizedDescription ?: @"需要完整日历访问权限，才能选择已有日历并检查重复写入。"];
+            return;
+        }
+        [self presentCalendarSettings];
+    }];
 }
 
 - (NSArray<NSDictionary *> *)appWriteMappingRows {
@@ -6646,7 +6758,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"确认写入日历";
-    alert.informativeText = [NSString stringWithFormat:@"将写入到“%@”日历。可取消某条，也可以改标题。", TrackerCalendarTitle];
+    alert.informativeText = [NSString stringWithFormat:@"将写入到“%@”日历。可取消某条，也可以改标题。", [self targetCalendarDisplayTitle]];
     alert.accessoryView = scroll;
     [alert addButtonWithTitle:@"写入"];
     [alert addButtonWithTitle:@"取消"];
@@ -7052,6 +7164,20 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 }
 
 - (EKCalendar *)trackerCalendarWithError:(NSError **)error {
+    NSString *selectedIdentifier = [self targetCalendarIdentifier];
+    if (selectedIdentifier.length > 0) {
+        EKCalendar *selected = [self selectedExistingCalendar];
+        if (selected) {
+            return selected;
+        }
+        if (error) {
+            *error = [NSError errorWithDomain:@"ForegroundTracker"
+                                         code:13
+                                     userInfo:@{NSLocalizedDescriptionKey: @"选中的写入日历不存在或不可写，请在“写入日历”里重新选择。"}];
+        }
+        return nil;
+    }
+
     for (EKCalendar *calendar in [self.eventStore calendarsForEntityType:EKEntityTypeEvent]) {
         if ([calendar.title isEqualToString:TrackerCalendarTitle]) {
             return calendar;
