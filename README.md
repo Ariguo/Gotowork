@@ -25,6 +25,8 @@ It is a menu bar app. When launched, it starts recording automatically and write
 ~/Library/Application Support/Gotowork/
 ```
 
+The command-line recorder uses the same Gotowork app data directory by default, so local app and CLI runs share one raw data source.
+
 Click `FT Rec` in the menu bar to open the native Chinese dashboard popover. It shows a three-column Apple Calendar-style view with date/project filters, app ranking, a central timeline, hover/selection details, pending calendar candidates, and quick controls for pause/resume, data folder, accessibility permission, and quit.
 
 ## Dashboard Preview Regression
@@ -69,7 +71,7 @@ Then run the command again.
 ## Record
 
 ```bash
-.build/debug/foreground-tracker record --output data/raw_segments.jsonl --poll 5 --idle 120 --reconcile 60
+.build/debug/foreground-tracker record --poll 5 --idle 120 --reconcile 60
 ```
 
 The recorder uses:
@@ -86,7 +88,7 @@ Browser apps are recorded at app level only. URL/title changes in Safari, Chrome
 ## Preview Calendar-Like Blocks
 
 ```bash
-.build/debug/foreground-tracker report --input data/raw_segments.jsonl --day 2026-05-22
+.build/debug/foreground-tracker report --day 2026-05-22
 ```
 
 Defaults:

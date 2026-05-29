@@ -61,6 +61,20 @@ static NSString *LocalDayString(NSDate *date) {
     return [formatter stringFromDate:date];
 }
 
+static NSURL *GotoworkDataDirectoryURL(void) {
+    NSURL *base = [[NSFileManager defaultManager] URLForDirectory:NSApplicationSupportDirectory
+                                                         inDomain:NSUserDomainMask
+                                                appropriateForURL:nil
+                                                           create:YES
+                                                            error:nil];
+    return [base URLByAppendingPathComponent:@"Gotowork" isDirectory:YES];
+}
+
+static NSString *GotoworkRawPathForDay(NSString *day) {
+    NSString *name = [NSString stringWithFormat:@"raw_%@.jsonl", day];
+    return [[GotoworkDataDirectoryURL() URLByAppendingPathComponent:name] path];
+}
+
 static NSString *ShortDuration(double seconds) {
     NSInteger total = MAX(0, (NSInteger)llround(seconds));
     if (total < 60) {
@@ -843,13 +857,14 @@ static void PrintHelp(void) {
         "Commands:\n"
         "  sample\n"
         "    Print the current frontmost app/window once.\n\n"
-        "  record [--output data/raw_segments.jsonl] [--poll 5] [--idle 120] [--reconcile 60]\n"
-        "    Record active frontmost-window segments as JSONL. This never writes Calendar.\n\n"
-        "  report [--input data/raw_segments.jsonl] [--day yyyy-mm-dd] [--min-duration 180]\n"
+        "  record [--output path] [--poll 5] [--idle 120] [--reconcile 60]\n"
+        "    Record active frontmost-window segments as JSONL under Gotowork app data by default.\n\n"
+        "  report [--input path] [--day yyyy-mm-dd] [--min-duration 180]\n"
         "         [--minute-min-active 40] [--minute-min-ratio 0.60]\n"
         "         [--rollup-window 3] [--rollup-min-active 120] [--key app|window]\n"
         "         [--bundle com.example.App] [--contains text] [--json]\n"
         "    Preview calendar-like blocks by assigning each minute to its dominant app/window,\n"
+        "    reading the selected day's Gotowork app data by default,\n"
         "    smoothing with a 3-minute raw-data window when one app exceeds 2 minutes, then merging.\n"
         "    Browser titles/URLs are ignored.\n"
     );
@@ -884,7 +899,7 @@ static int Run(NSArray<NSString *> *args) {
     }
 
     if ([command isEqualToString:@"record"]) {
-        NSString *output = ExpandPath(ArgValue(rest, @"--output", @"data/raw_segments.jsonl"));
+        NSString *output = ExpandPath(ArgValue(rest, @"--output", GotoworkRawPathForDay(LocalDayString([NSDate date]))));
         ForegroundRecorder *recorder = [[ForegroundRecorder alloc] initWithOutputURL:[NSURL fileURLWithPath:output]
                                                                                 poll:ArgDouble(rest, @"--poll", 5)
                                                                                 idle:ArgDouble(rest, @"--idle", 120)
@@ -894,10 +909,10 @@ static int Run(NSArray<NSString *> *args) {
     }
 
     if ([command isEqualToString:@"report"]) {
-        NSString *input = ExpandPath(ArgValue(rest, @"--input", @"data/raw_segments.jsonl"));
         NSString *key = ArgValue(rest, @"--key", @"app");
         NSString *explicitDay = ArgValue(rest, @"--day", @"");
         NSString *day = explicitDay.length > 0 ? explicitDay : LocalDayString([NSDate date]);
+        NSString *input = ExpandPath(ArgValue(rest, @"--input", GotoworkRawPathForDay(day)));
         NSError *error = nil;
         NSArray *segments = ReadSegments([NSURL fileURLWithPath:input], key, &error);
         if (!segments) {

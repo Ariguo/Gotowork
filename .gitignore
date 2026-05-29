@@ -4,11 +4,17 @@
 # Build outputs
 .build/
 dist/
+DerivedData/
+*.app/
 
 # Local runtime data
 data/
 records/
 logs/
+/legacy-new-chat-data/
+/Application Support/Gotowork/
+/Application Support/ForegroundTracker/
+/ForegroundTracker/
 *.log
 *.pid
 
@@ -24,5 +30,8 @@ logs/
 *.ics
 *.csv
 *.jsonl
+*.jsonl.bak-*
+calendar_candidates*.json
+ten_min_*.json
 tmp/
 temp/
