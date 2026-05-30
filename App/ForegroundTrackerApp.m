@@ -1072,6 +1072,28 @@ static BOOL SegmentShouldHideFromStats(NSDictionary *segment) {
     return key.length > 0 && [IgnoredAppKeysSetting() containsObject:key];
 }
 
+static NSString *SuggestedAppFilterReason(NSString *key, NSString *title, NSString *bundleID) {
+    NSString *safeKey = key ?: @"";
+    NSString *safeTitle = title ?: @"";
+    NSString *safeBundleID = bundleID ?: @"";
+    if ([safeKey isEqualToString:@"com.apple.loginwindow"] || [safeTitle isEqualToString:@"登录窗口"]) {
+        return @"登录/锁屏切换";
+    }
+    if ([safeKey isEqualToString:@"system:accessibility-warning"] || [safeTitle isEqualToString:@"辅助功能提醒"]) {
+        return @"权限提醒弹窗";
+    }
+    if ([safeBundleID isEqualToString:@"com.apple.dock"] || [safeTitle isEqualToString:@"程序坞"]) {
+        return @"系统界面";
+    }
+    if ([safeBundleID isEqualToString:@"com.apple.systempreferences"] || [safeTitle isEqualToString:@"系统设置"]) {
+        return @"临时设置";
+    }
+    if ([safeBundleID isEqualToString:@"com.apple.SystemUIServer"] || [safeTitle isEqualToString:@"控制中心"]) {
+        return @"菜单栏/系统控制";
+    }
+    return @"";
+}
+
 static NSColor *RGB(CGFloat red, CGFloat green, CGFloat blue) {
     return [NSColor colorWithCalibratedRed:red / 255.0 green:green / 255.0 blue:blue / 255.0 alpha:1.0];
 }
@@ -7316,7 +7338,8 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
             @"key": key,
             @"title": app[@"title"] ?: key,
             @"bundle_id": app[@"bundle_id"] ?: @"",
-            @"seconds": app[@"seconds"] ?: @0
+            @"seconds": app[@"seconds"] ?: @0,
+            @"suggested_filter_reason": SuggestedAppFilterReason(key, app[@"title"] ?: key, app[@"bundle_id"] ?: @"")
         } mutableCopy];
     }
 
@@ -7389,7 +7412,8 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
             @"key": key,
             @"title": title,
             @"bundle_id": @"",
-            @"seconds": @0
+            @"seconds": @0,
+            @"suggested_filter_reason": SuggestedAppFilterReason(key, title, @"")
         } mutableCopy];
     }
 
@@ -7398,6 +7422,11 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         BOOL rightIgnored = [ignoredKeys containsObject:b[@"key"]];
         if (leftIgnored != rightIgnored) {
             return leftIgnored ? NSOrderedAscending : NSOrderedDescending;
+        }
+        BOOL leftSuggested = [a[@"suggested_filter_reason"] length] > 0;
+        BOOL rightSuggested = [b[@"suggested_filter_reason"] length] > 0;
+        if (leftSuggested != rightSuggested) {
+            return leftSuggested ? NSOrderedAscending : NSOrderedDescending;
         }
         return [b[@"seconds"] compare:a[@"seconds"]];
     }];
@@ -7426,6 +7455,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         NSString *key = app[@"key"] ?: @"";
         NSString *title = app[@"title"] ?: key;
         NSString *duration = [app[@"seconds"] doubleValue] > 0 ? ShortDuration([app[@"seconds"] doubleValue]) : @"无今日时长";
+        NSString *suggestedReason = app[@"suggested_filter_reason"] ?: @"";
         BOOL ignored = [ignoredKeys containsObject:key];
 
         NSStackView *row = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 400, 42)];
@@ -7438,7 +7468,10 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         check.state = ignored ? NSControlStateValueOff : NSControlStateValueOn;
         check.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
 
-        NSTextField *label = [NSTextField labelWithString:key];
+        NSString *detail = suggestedReason.length > 0
+            ? [NSString stringWithFormat:@"%@ · 建议过滤：%@", key, suggestedReason]
+            : key;
+        NSTextField *label = [NSTextField labelWithString:detail];
         label.font = [NSFont systemFontOfSize:10];
         label.textColor = [NSColor secondaryLabelColor];
         label.lineBreakMode = NSLineBreakByTruncatingMiddle;
