@@ -1008,12 +1008,18 @@ static NSString *LocalizedStatusText(NSString *status) {
     return status;
 }
 
+static BOOL SegmentIsGotoworkSelf(NSDictionary *segment) {
+    NSString *bundleID = segment[@"bundle_id"] ?: @"";
+    NSString *app = segment[@"app_name"] ?: bundleID;
+    return [bundleID isEqualToString:GotoworkBundleIdentifier] ||
+           [app containsString:@"Gotowork"] ||
+           [app containsString:@"Foreground Tracker"];
+}
+
 static NSString *SegmentKey(NSDictionary *segment) {
     NSString *bundleID = segment[@"bundle_id"] ?: @"";
     NSString *app = segment[@"app_name"] ?: bundleID;
-    if ([bundleID isEqualToString:GotoworkBundleIdentifier] ||
-        [app containsString:@"Gotowork"] ||
-        [app containsString:@"Foreground Tracker"]) {
+    if (SegmentIsGotoworkSelf(segment)) {
         return GotoworkBundleIdentifier;
     }
     if ([app isEqualToString:@"loginwindow"] || [bundleID isEqualToString:@"com.apple.loginwindow"]) {
@@ -1031,9 +1037,7 @@ static NSString *SegmentKey(NSDictionary *segment) {
 static NSString *SegmentTitle(NSDictionary *segment) {
     NSString *bundleID = segment[@"bundle_id"] ?: @"";
     NSString *app = segment[@"app_name"] ?: bundleID;
-    if ([bundleID isEqualToString:GotoworkBundleIdentifier] ||
-        [app containsString:@"Gotowork"] ||
-        [app containsString:@"Foreground Tracker"]) {
+    if (SegmentIsGotoworkSelf(segment)) {
         return @"前台记录";
     }
     if ([app isEqualToString:@"loginwindow"] || [bundleID isEqualToString:@"com.apple.loginwindow"]) {
@@ -1490,6 +1494,9 @@ static NSArray<NSMutableDictionary *> *ReadRawSegments(NSURL *rawURL) {
         if (!DecorateSegment(segment)) {
             continue;
         }
+        if (SegmentIsGotoworkSelf(segment)) {
+            continue;
+        }
         double duration = [segment[@"duration_seconds"] doubleValue];
         if (duration <= 0) {
             duration = [segment[@"__end"] timeIntervalSinceDate:segment[@"__start"]];
@@ -1523,6 +1530,9 @@ static NSArray<NSMutableDictionary *> *ReadRawSegmentsIncludingShort(NSURL *rawU
         NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
         NSMutableDictionary *segment = [[NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] mutableCopy];
         if (!DecorateSegment(segment)) {
+            continue;
+        }
+        if (SegmentIsGotoworkSelf(segment)) {
             continue;
         }
         double duration = RawSegmentDuration(segment);
@@ -1880,6 +1890,7 @@ static void AddOpenSegmentIfInRange(NSMutableArray<NSMutableDictionary *> *segme
     }
     NSMutableDictionary *open = [openSegment mutableCopy];
     if (DecorateSegment(open) &&
+        !SegmentIsGotoworkSelf(open) &&
         [open[@"__start"] compare:startInclusive] != NSOrderedAscending &&
         [open[@"__start"] compare:endExclusive] == NSOrderedAscending) {
         [segments addObject:open];
