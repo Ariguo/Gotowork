@@ -49,6 +49,7 @@ static NSString * const SettingCalendarWindowMinutesKey = @"calendar_window_minu
 static NSString * const SettingCalendarMinBlockMinutesKey = @"calendar_min_block_minutes";
 static NSString * const TargetCalendarIdentifierKey = @"target_calendar_identifier";
 static NSString * const IgnoredCalendarBlockKeysKey = @"ignored_calendar_block_keys";
+static NSString * const IgnoredAppKeysKey = @"ignored_app_keys";
 static NSString * const ProjectLabelsByBlockKeyKey = @"project_labels_by_block_key";
 static NSString * const BlockTitlesByBlockKeyKey = @"block_titles_by_block_key";
 static NSString * const AppWriteMappingsByKeyKey = @"app_write_mappings_by_key";
@@ -58,6 +59,8 @@ static NSString * const ManualCalendarBlocksKey = @"manual_calendar_blocks";
 static NSTimeInterval MinimumRecordedSegmentSeconds(void) {
     return 1.0;
 }
+
+static NSSet<NSString *> *TemporaryIgnoredAppKeys = nil;
 
 static void RegisterDefaultSettings(void) {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
@@ -1052,6 +1055,23 @@ static NSString *SegmentTitle(NSDictionary *segment) {
     return app;
 }
 
+static NSSet<NSString *> *IgnoredAppKeysSetting(void) {
+    NSArray *keys = [[NSUserDefaults standardUserDefaults] arrayForKey:IgnoredAppKeysKey];
+    NSMutableSet *ignored = keys.count ? [NSMutableSet setWithArray:keys] : [NSMutableSet set];
+    if (TemporaryIgnoredAppKeys.count > 0) {
+        [ignored unionSet:TemporaryIgnoredAppKeys];
+    }
+    return ignored;
+}
+
+static BOOL SegmentShouldHideFromStats(NSDictionary *segment) {
+    if (SegmentIsGotoworkSelf(segment)) {
+        return YES;
+    }
+    NSString *key = segment[@"__key"] ?: SegmentKey(segment);
+    return key.length > 0 && [IgnoredAppKeysSetting() containsObject:key];
+}
+
 static NSColor *RGB(CGFloat red, CGFloat green, CGFloat blue) {
     return [NSColor colorWithCalibratedRed:red / 255.0 green:green / 255.0 blue:blue / 255.0 alpha:1.0];
 }
@@ -1475,7 +1495,9 @@ static BOOL DecorateSegment(NSMutableDictionary *segment) {
 
 static NSString *DashboardDateTitle(NSDate *date);
 
-static NSArray<NSMutableDictionary *> *ReadRawSegments(NSURL *rawURL) {
+static NSArray<NSMutableDictionary *> *ReadRawSegmentsFromURL(NSURL *rawURL,
+                                                              BOOL includeShortSegments,
+                                                              BOOL includeIgnoredApps) {
     if (![[NSFileManager defaultManager] fileExistsAtPath:rawURL.path]) {
         return @[];
     }
@@ -1494,49 +1516,14 @@ static NSArray<NSMutableDictionary *> *ReadRawSegments(NSURL *rawURL) {
         if (!DecorateSegment(segment)) {
             continue;
         }
-        if (SegmentIsGotoworkSelf(segment)) {
+        if (SegmentIsGotoworkSelf(segment) || (!includeIgnoredApps && SegmentShouldHideFromStats(segment))) {
             continue;
         }
         double duration = [segment[@"duration_seconds"] doubleValue];
         if (duration <= 0) {
             duration = [segment[@"__end"] timeIntervalSinceDate:segment[@"__start"]];
         }
-        if (duration <= MinimumRecordedSegmentSeconds()) {
-            continue;
-        }
-        [segments addObject:segment];
-    }
-
-    [segments sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-        return [a[@"__start"] compare:b[@"__start"]];
-    }];
-    return segments;
-}
-
-static NSArray<NSMutableDictionary *> *ReadRawSegmentsIncludingShort(NSURL *rawURL) {
-    if (![[NSFileManager defaultManager] fileExistsAtPath:rawURL.path]) {
-        return @[];
-    }
-    NSString *body = [NSString stringWithContentsOfURL:rawURL encoding:NSUTF8StringEncoding error:nil];
-    if (body.length == 0) {
-        return @[];
-    }
-
-    NSMutableArray *segments = [NSMutableArray array];
-    for (NSString *line in [body componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
-        if (line.length == 0) {
-            continue;
-        }
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        NSMutableDictionary *segment = [[NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] mutableCopy];
-        if (!DecorateSegment(segment)) {
-            continue;
-        }
-        if (SegmentIsGotoworkSelf(segment)) {
-            continue;
-        }
-        double duration = RawSegmentDuration(segment);
-        if (duration <= 0) {
+        if (duration <= 0 || (!includeShortSegments && duration <= MinimumRecordedSegmentSeconds())) {
             continue;
         }
         segment[@"__duration_seconds"] = @(duration);
@@ -1547,6 +1534,18 @@ static NSArray<NSMutableDictionary *> *ReadRawSegmentsIncludingShort(NSURL *rawU
         return [a[@"__start"] compare:b[@"__start"]];
     }];
     return segments;
+}
+
+static NSArray<NSMutableDictionary *> *ReadRawSegments(NSURL *rawURL) {
+    return ReadRawSegmentsFromURL(rawURL, NO, NO);
+}
+
+static NSArray<NSMutableDictionary *> *ReadRawSegmentsIncludingShort(NSURL *rawURL) {
+    return ReadRawSegmentsFromURL(rawURL, YES, NO);
+}
+
+static NSArray<NSMutableDictionary *> *ReadRawSegmentsForAppFiltering(NSURL *rawURL) {
+    return ReadRawSegmentsFromURL(rawURL, YES, YES);
 }
 
 static NSArray<NSString *> *DurationDistributionBucketLabels(void) {
@@ -1890,7 +1889,7 @@ static void AddOpenSegmentIfInRange(NSMutableArray<NSMutableDictionary *> *segme
     }
     NSMutableDictionary *open = [openSegment mutableCopy];
     if (DecorateSegment(open) &&
-        !SegmentIsGotoworkSelf(open) &&
+        !SegmentShouldHideFromStats(open) &&
         [open[@"__start"] compare:startInclusive] != NSOrderedAscending &&
         [open[@"__start"] compare:endExclusive] == NSOrderedAscending) {
         [segments addObject:open];
@@ -6939,6 +6938,10 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     return keys.count ? [NSSet setWithArray:keys] : [NSSet set];
 }
 
+- (NSSet<NSString *> *)ignoredAppKeys {
+    return IgnoredAppKeysSetting();
+}
+
 - (NSDictionary<NSString *, NSString *> *)projectLabelsByBlockKey {
     NSDictionary *labels = [[NSUserDefaults standardUserDefaults] dictionaryForKey:ProjectLabelsByBlockKeyKey];
     return [labels isKindOfClass:NSDictionary.class] ? labels : @{};
@@ -7042,6 +7045,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSArray *items = @[
         @[@"设置", NSStringFromSelector(@selector(openSettings:))],
         @[@"片段分布", NSStringFromSelector(@selector(openDurationDistribution:))],
+        @[@"应用过滤", NSStringFromSelector(@selector(openAppFilters:))],
         @[@"写入日历", NSStringFromSelector(@selector(openCalendarSettings:))],
         @[@"应用写入映射", NSStringFromSelector(@selector(openAppWriteMappings:))],
         @[@"打开数据目录", NSStringFromSelector(@selector(openDataFolder:))],
@@ -7350,6 +7354,136 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     field.placeholderString = placeholder ?: @"";
     field.stringValue = value ?: @"";
     return field;
+}
+
+- (NSArray<NSDictionary *> *)appFilterRows {
+    NSDate *dashboardDate = [self dashboardDate];
+    NSArray *segments = ReadRawSegmentsForAppFiltering([self.store rawURLForDate:dashboardDate]);
+    NSArray *residentSegments = ReadRawSegmentsForAppFiltering([self.store residentRawURLForDate:dashboardDate]);
+    NSDictionary *summary = AppSummaryFromSegments([segments arrayByAddingObjectsFromArray:residentSegments]);
+    NSArray *topApps = summary[@"top_apps"] ?: @[];
+    NSSet *ignoredKeys = [self ignoredAppKeys];
+    NSDictionary *existingMappings = [self appWriteMappingsByAppKey];
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *rowsByKey = [NSMutableDictionary dictionary];
+
+    for (NSDictionary *app in topApps) {
+        NSString *key = app[@"key"];
+        if (key.length == 0 || [key hasPrefix:@"__"]) {
+            continue;
+        }
+        rowsByKey[key] = [@{
+            @"key": key,
+            @"title": app[@"title"] ?: key,
+            @"bundle_id": app[@"bundle_id"] ?: @"",
+            @"seconds": app[@"seconds"] ?: @0
+        } mutableCopy];
+    }
+
+    for (NSString *key in ignoredKeys) {
+        if (key.length == 0 || rowsByKey[key]) {
+            continue;
+        }
+        NSDictionary *mapping = existingMappings[key];
+        NSString *title = [mapping isKindOfClass:NSDictionary.class] && [mapping[@"event_title"] length] > 0 ? mapping[@"event_title"] : key;
+        rowsByKey[key] = [@{
+            @"key": key,
+            @"title": title,
+            @"bundle_id": @"",
+            @"seconds": @0
+        } mutableCopy];
+    }
+
+    NSArray *rows = [rowsByKey.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        BOOL leftIgnored = [ignoredKeys containsObject:a[@"key"]];
+        BOOL rightIgnored = [ignoredKeys containsObject:b[@"key"]];
+        if (leftIgnored != rightIgnored) {
+            return leftIgnored ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [b[@"seconds"] compare:a[@"seconds"]];
+    }];
+    return rows.count > 16 ? [rows subarrayWithRange:NSMakeRange(0, 16)] : rows;
+}
+
+- (void)openAppFilters:(id)sender {
+    NSArray<NSDictionary *> *apps = [self appFilterRows];
+    NSMutableSet<NSString *> *ignoredKeys = [[self ignoredAppKeys] mutableCopy] ?: [NSMutableSet set];
+    if (apps.count == 0) {
+        [self showAlertWithTitle:@"还没有可过滤的应用"
+                         message:@"Gotowork 需要先记录到一些前台应用，才会在这里显示应用过滤。"];
+        return;
+    }
+
+    NSMutableArray<NSDictionary *> *controls = [NSMutableArray array];
+    CGFloat rowHeight = 50.0;
+    CGFloat documentHeight = MAX(72.0, apps.count * rowHeight + 16.0);
+    NSView *document = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, documentHeight)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(10, 8, 400, documentHeight - 16)];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.spacing = 8;
+    stack.alignment = NSLayoutAttributeLeading;
+
+    for (NSDictionary *app in apps) {
+        NSString *key = app[@"key"] ?: @"";
+        NSString *title = app[@"title"] ?: key;
+        NSString *duration = [app[@"seconds"] doubleValue] > 0 ? ShortDuration([app[@"seconds"] doubleValue]) : @"无今日时长";
+        BOOL ignored = [ignoredKeys containsObject:key];
+
+        NSStackView *row = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 400, 42)];
+        row.orientation = NSUserInterfaceLayoutOrientationVertical;
+        row.spacing = 3;
+
+        NSButton *check = [NSButton checkboxWithTitle:[NSString stringWithFormat:@"%@  %@", title, duration]
+                                               target:nil
+                                               action:nil];
+        check.state = ignored ? NSControlStateValueOff : NSControlStateValueOn;
+        check.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+
+        NSTextField *label = [NSTextField labelWithString:key];
+        label.font = [NSFont systemFontOfSize:10];
+        label.textColor = [NSColor secondaryLabelColor];
+        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        label.frame = NSMakeRect(22, 0, 370, 14);
+
+        [row addArrangedSubview:check];
+        [row addArrangedSubview:label];
+        [stack addArrangedSubview:row];
+        [controls addObject:@{@"key": key, @"check": check}];
+    }
+
+    [document addSubview:stack];
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 440, 320)];
+    scroll.hasVerticalScroller = YES;
+    scroll.borderType = NSBezelBorder;
+    scroll.documentView = document;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"应用过滤";
+    alert.informativeText = @"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。";
+    alert.accessoryView = scroll;
+    [alert addButtonWithTitle:@"保存"];
+    [alert addButtonWithTitle:@"取消"];
+    [NSApp activateIgnoringOtherApps:YES];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    for (NSDictionary *row in controls) {
+        NSString *key = row[@"key"];
+        NSButton *check = row[@"check"];
+        if (key.length == 0) {
+            continue;
+        }
+        if (check.state == NSControlStateValueOn) {
+            [ignoredKeys removeObject:key];
+        } else {
+            [ignoredKeys addObject:key];
+        }
+    }
+
+    [[NSUserDefaults standardUserDefaults] setObject:ignoredKeys.allObjects forKey:IgnoredAppKeysKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self updateStatus:@"应用过滤已更新"];
+    [self refreshDashboard];
 }
 
 - (void)openAppWriteMappings:(id)sender {
@@ -8113,6 +8247,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     NSString *highlightAppKey = nil;
     NSString *manualDraftSpec = nil;
     NSString *previewNowClock = nil;
+    NSMutableSet<NSString *> *temporaryIgnoredAppKeys = [NSMutableSet set];
     CGFloat previewWidth = 1160.0;
     CGFloat previewHeight = 760.0;
     BOOL compactRaw = NO;
@@ -8146,6 +8281,11 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             compactRaw = YES;
         } else if ([arg isEqualToString:@"--highlight-app"] && i + 1 < argc) {
             highlightAppKey = [NSString stringWithUTF8String:argv[++i]];
+        } else if ([arg isEqualToString:@"--ignore-app"] && i + 1 < argc) {
+            NSString *ignoredKey = [NSString stringWithUTF8String:argv[++i]];
+            if (ignoredKey.length > 0) {
+                [temporaryIgnoredAppKeys addObject:ignoredKey];
+            }
         } else if ([arg isEqualToString:@"--select-first-calendar"]) {
             selectFirstCalendar = YES;
         } else if ([arg isEqualToString:@"--hover-first-calendar"]) {
@@ -8202,6 +8342,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     NSAppearanceName appearanceName = dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
     NSApp.appearance = [NSAppearance appearanceNamed:appearanceName];
     RegisterDefaultSettings();
+    TemporaryIgnoredAppKeys = temporaryIgnoredAppKeys.count > 0 ? [temporaryIgnoredAppKeys copy] : nil;
 
     SegmentStore *store = [[SegmentStore alloc] initWithDataDirectory:DefaultApplicationSupportDirectory()];
     NSDictionary *appWriteMappings = [[NSUserDefaults standardUserDefaults] dictionaryForKey:AppWriteMappingsByKeyKey] ?: @{};
