@@ -1504,6 +1504,199 @@ static NSArray<NSMutableDictionary *> *ReadRawSegments(NSURL *rawURL) {
     return segments;
 }
 
+static NSArray<NSMutableDictionary *> *ReadRawSegmentsIncludingShort(NSURL *rawURL) {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:rawURL.path]) {
+        return @[];
+    }
+    NSString *body = [NSString stringWithContentsOfURL:rawURL encoding:NSUTF8StringEncoding error:nil];
+    if (body.length == 0) {
+        return @[];
+    }
+
+    NSMutableArray *segments = [NSMutableArray array];
+    for (NSString *line in [body componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        if (line.length == 0) {
+            continue;
+        }
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSMutableDictionary *segment = [[NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] mutableCopy];
+        if (!DecorateSegment(segment)) {
+            continue;
+        }
+        double duration = RawSegmentDuration(segment);
+        if (duration <= 0) {
+            continue;
+        }
+        segment[@"__duration_seconds"] = @(duration);
+        [segments addObject:segment];
+    }
+
+    [segments sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"__start"] compare:b[@"__start"]];
+    }];
+    return segments;
+}
+
+static NSArray<NSString *> *DurationDistributionBucketLabels(void) {
+    return @[@"<=1s", @"1-2s", @"2-5s", @"5-10s", @"10-30s", @"30-60s", @"1-3m", @"3-5m", @"5-10m", @">10m"];
+}
+
+static NSInteger DurationDistributionBucketIndex(double seconds) {
+    if (seconds <= 1.0) {
+        return 0;
+    }
+    if (seconds <= 2.0) {
+        return 1;
+    }
+    if (seconds <= 5.0) {
+        return 2;
+    }
+    if (seconds <= 10.0) {
+        return 3;
+    }
+    if (seconds <= 30.0) {
+        return 4;
+    }
+    if (seconds <= 60.0) {
+        return 5;
+    }
+    if (seconds <= 180.0) {
+        return 6;
+    }
+    if (seconds <= 300.0) {
+        return 7;
+    }
+    if (seconds <= 600.0) {
+        return 8;
+    }
+    return 9;
+}
+
+static NSDictionary *SegmentDurationDistribution(NSArray<NSMutableDictionary *> *segments) {
+    NSArray<NSString *> *labels = DurationDistributionBucketLabels();
+    NSMutableArray<NSMutableDictionary *> *buckets = [NSMutableArray array];
+    for (NSString *label in labels) {
+        [buckets addObject:[@{@"label": label, @"count": @0, @"seconds": @0.0} mutableCopy]];
+    }
+
+    NSInteger recordedCount = 0;
+    NSInteger filteredCount = 0;
+    NSInteger absorbedCount = 0;
+    double totalSeconds = 0;
+    double recordedSeconds = 0;
+    double filteredSeconds = 0;
+    double absorbedSeconds = 0;
+
+    for (NSDictionary *segment in segments ?: @[]) {
+        double duration = [segment[@"__duration_seconds"] doubleValue];
+        if (duration <= 0) {
+            duration = RawSegmentDuration(segment);
+        }
+        if (duration <= 0) {
+            continue;
+        }
+
+        NSInteger bucketIndex = DurationDistributionBucketIndex(duration);
+        NSMutableDictionary *bucket = buckets[bucketIndex];
+        bucket[@"count"] = @([bucket[@"count"] integerValue] + 1);
+        bucket[@"seconds"] = @([bucket[@"seconds"] doubleValue] + duration);
+        totalSeconds += duration;
+
+        if (duration <= MinimumRecordedSegmentSeconds()) {
+            filteredCount += 1;
+            filteredSeconds += duration;
+        } else {
+            recordedCount += 1;
+            recordedSeconds += duration;
+        }
+
+        absorbedCount += [segment[@"absorbed_short_interruption_count"] integerValue];
+        absorbedSeconds += [segment[@"absorbed_short_interruption_seconds"] doubleValue];
+    }
+
+    return @{
+        @"buckets": buckets,
+        @"raw_segment_count": @(segments.count),
+        @"recorded_segment_count": @(recordedCount),
+        @"filtered_segment_count": @(filteredCount),
+        @"total_seconds": @(totalSeconds),
+        @"recorded_seconds": @(recordedSeconds),
+        @"filtered_seconds": @(filteredSeconds),
+        @"absorbed_short_interruption_count": @(absorbedCount),
+        @"absorbed_short_interruption_seconds": @(absorbedSeconds)
+    };
+}
+
+static NSString *DurationDistributionReportSection(NSString *title, NSDictionary *distribution) {
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSInteger rawCount = [distribution[@"raw_segment_count"] integerValue];
+    NSInteger recordedCount = [distribution[@"recorded_segment_count"] integerValue];
+    NSInteger filteredCount = [distribution[@"filtered_segment_count"] integerValue];
+    NSInteger absorbedCount = [distribution[@"absorbed_short_interruption_count"] integerValue];
+    double recordedSeconds = [distribution[@"recorded_seconds"] doubleValue];
+    double filteredSeconds = [distribution[@"filtered_seconds"] doubleValue];
+    double absorbedSeconds = [distribution[@"absorbed_short_interruption_seconds"] doubleValue];
+
+    [lines addObject:[NSString stringWithFormat:@"%@：%@ · %ld 段", title, ShortDuration(recordedSeconds), (long)recordedCount]];
+    if (filteredCount > 0) {
+        [lines addObject:[NSString stringWithFormat:@"<=1s 已过滤：%ld 段 · %@", (long)filteredCount, ShortDuration(filteredSeconds)]];
+    }
+    if (absorbedCount > 0) {
+        [lines addObject:[NSString stringWithFormat:@"来回切换已合并：%ld 次 · %@", (long)absorbedCount, ShortDuration(absorbedSeconds)]];
+    }
+    if (rawCount == 0) {
+        [lines addObject:@"还没有 raw 片段。"];
+        return [lines componentsJoinedByString:@"\n"];
+    }
+
+    [lines addObject:@""];
+    [lines addObject:@"区间\t段数\t时长"];
+    for (NSDictionary *bucket in distribution[@"buckets"] ?: @[]) {
+        NSInteger count = [bucket[@"count"] integerValue];
+        double seconds = [bucket[@"seconds"] doubleValue];
+        [lines addObject:[NSString stringWithFormat:@"%@\t%ld\t%@",
+                          bucket[@"label"] ?: @"",
+                          (long)count,
+                          ShortDuration(seconds)]];
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+static NSString *DurationDistributionReport(NSArray<NSMutableDictionary *> *foregroundSegments,
+                                            NSArray<NSMutableDictionary *> *residentSegments) {
+    NSMutableArray<NSString *> *sections = [NSMutableArray array];
+    [sections addObject:DurationDistributionReportSection(@"前台", SegmentDurationDistribution(foregroundSegments))];
+    if (residentSegments.count > 0) {
+        [sections addObject:DurationDistributionReportSection(@"常驻", SegmentDurationDistribution(residentSegments))];
+    }
+    return [sections componentsJoinedByString:@"\n\n"];
+}
+
+static void PrintDurationDistribution(NSDate *date,
+                                      NSString *source,
+                                      NSArray<NSMutableDictionary *> *segments) {
+    NSDictionary *distribution = SegmentDurationDistribution(segments);
+    printf("date=%s source=%s raw_segments=%ld recorded_segments=%ld filtered_le_1s=%ld recorded_seconds=%.1f filtered_seconds=%.1f absorbed_count=%ld absorbed_seconds=%.1f raw_merge_threshold=%.1f\n",
+           [DayString(date) UTF8String],
+           [(source ?: @"foreground") UTF8String],
+           (long)[distribution[@"raw_segment_count"] integerValue],
+           (long)[distribution[@"recorded_segment_count"] integerValue],
+           (long)[distribution[@"filtered_segment_count"] integerValue],
+           [distribution[@"recorded_seconds"] doubleValue],
+           [distribution[@"filtered_seconds"] doubleValue],
+           (long)[distribution[@"absorbed_short_interruption_count"] integerValue],
+           [distribution[@"absorbed_short_interruption_seconds"] doubleValue],
+           RawMergeInterruptionSetting());
+    for (NSDictionary *bucket in distribution[@"buckets"] ?: @[]) {
+        printf("date=%s source=%s bucket=%s count=%ld seconds=%.1f\n",
+               [DayString(date) UTF8String],
+               [(source ?: @"foreground") UTF8String],
+               [bucket[@"label"] ?: @"" UTF8String],
+               (long)[bucket[@"count"] integerValue],
+               [bucket[@"seconds"] doubleValue]);
+    }
+}
+
 static void AddSecondsToApps(NSMutableDictionary<NSString *, NSMutableDictionary *> *apps,
                              NSString *key,
                              NSString *title,
@@ -6813,6 +7006,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"更多"];
     NSArray *items = @[
         @[@"设置", NSStringFromSelector(@selector(openSettings:))],
+        @[@"片段分布", NSStringFromSelector(@selector(openDurationDistribution:))],
         @[@"写入日历", NSStringFromSelector(@selector(openCalendarSettings:))],
         @[@"应用写入映射", NSStringFromSelector(@selector(openAppWriteMappings:))],
         @[@"打开数据目录", NSStringFromSelector(@selector(openDataFolder:))],
@@ -6860,6 +7054,43 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     } else {
         [[NSWorkspace sharedWorkspace] openURL:self.store.dataDirectory];
     }
+}
+
+- (void)openDurationDistribution:(id)sender {
+    NSDate *dashboardDate = [self dashboardDate];
+    NSArray *foregroundSegments = ReadRawSegmentsIncludingShort([self.store rawURLForDate:dashboardDate]);
+    NSArray *residentSegments = ReadRawSegmentsIncludingShort([self.store residentRawURLForDate:dashboardDate]);
+    if (foregroundSegments.count == 0 && residentSegments.count == 0) {
+        [self showAlertWithTitle:@"还没有片段"
+                         message:@"Gotowork 需要先记录到一些前台或常驻时段，才会显示片段分布。"];
+        return;
+    }
+
+    NSString *report = DurationDistributionReport(foregroundSegments, residentSegments);
+    NSArray *lines = [report componentsSeparatedByString:@"\n"];
+    CGFloat documentHeight = MAX(220.0, lines.count * 18.0 + 24.0);
+    NSTextView *textView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 430, documentHeight)];
+    textView.string = report;
+    textView.editable = NO;
+    textView.selectable = YES;
+    textView.drawsBackground = NO;
+    textView.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+    textView.textContainerInset = NSMakeSize(10, 10);
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 450, 280)];
+    scroll.hasVerticalScroller = YES;
+    scroll.borderType = NSBezelBorder;
+    scroll.documentView = textView;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"片段时长分布";
+    alert.informativeText = [NSString stringWithFormat:@"%@ · 原始切换合并 %.0fs",
+                             DashboardDateTitle(dashboardDate),
+                             RawMergeInterruptionSetting()];
+    alert.accessoryView = scroll;
+    [alert addButtonWithTitle:@"好"];
+    [NSApp activateIgnoringOtherApps:YES];
+    [alert runModal];
 }
 
 - (NSPopUpButton *)settingsPopupWithValues:(NSArray<NSNumber *> *)values current:(double)current suffix:(NSString *)suffix {
@@ -7844,6 +8075,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     BOOL compactRaw = NO;
     BOOL dark = NO;
     BOOL dumpBlocks = NO;
+    BOOL dumpDurationDistribution = NO;
     BOOL selectFirstCalendar = NO;
     BOOL hoverFirstCalendar = NO;
     BOOL selectFirstActivity = NO;
@@ -7864,6 +8096,9 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             dark = YES;
         } else if ([arg isEqualToString:@"--dump-dashboard-blocks"]) {
             dumpBlocks = YES;
+        } else if ([arg isEqualToString:@"--dump-duration-distribution"] ||
+                   [arg isEqualToString:@"--dump-segment-duration-distribution"]) {
+            dumpDurationDistribution = YES;
         } else if ([arg isEqualToString:@"--compact-raw"]) {
             compactRaw = YES;
         } else if ([arg isEqualToString:@"--highlight-app"] && i + 1 < argc) {
@@ -7915,7 +8150,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             }
         }
     }
-    if (outputPath.length == 0 && !dumpBlocks && !compactRaw) {
+    if (outputPath.length == 0 && !dumpBlocks && !compactRaw && !dumpDurationDistribution) {
         return -1;
     }
 
@@ -7944,6 +8179,14 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             return 2;
         }
         printf("%s\n", [[store rawURLForDate:previewDate].path UTF8String]);
+        return 0;
+    }
+    if (dumpDurationDistribution) {
+        PrintDurationDistribution(previewDate, @"foreground", ReadRawSegmentsIncludingShort([store rawURLForDate:previewDate]));
+        NSArray *residentSegments = ReadRawSegmentsIncludingShort([store residentRawURLForDate:previewDate]);
+        if (residentSegments.count > 0) {
+            PrintDurationDistribution(previewDate, @"resident", residentSegments);
+        }
         return 0;
     }
     if (previewNowClock.length > 0) {
