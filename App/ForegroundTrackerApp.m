@@ -6868,7 +6868,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     double bestDelta = DBL_MAX;
     for (NSInteger i = 0; i < values.count; i++) {
         NSNumber *value = values[i];
-        NSString *title = [NSString stringWithFormat:@"%.0f %@", value.doubleValue, suffix ?: @""];
+        NSString *title = value.doubleValue <= 0 ? @"关闭" : [NSString stringWithFormat:@"%.0f %@", value.doubleValue, suffix ?: @""];
         [popup addItemWithTitle:title];
         popup.itemArray.lastObject.representedObject = value;
         double delta = fabs(value.doubleValue - current);
@@ -6891,14 +6891,16 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 
 - (void)openSettings:(id)sender {
     NSMutableDictionary<NSString *, NSPopUpButton *> *popups = [NSMutableDictionary dictionary];
+    NSTimeInterval previousRawMergeSeconds = RawMergeInterruptionSetting();
     NSArray *rows = @[
         @{@"label": @"idle 判定", @"key": SettingIdleSecondsKey, @"values": @[@60, @120, @300], @"suffix": @"秒"},
+        @{@"label": @"原始切换合并", @"key": SettingRawMergeInterruptionSecondsKey, @"values": @[@0, @1, @2, @3, @5], @"suffix": @"秒"},
         @{@"label": @"短打断吸收", @"key": SettingShortInterruptionSecondsKey, @"values": @[@15, @30, @60], @"suffix": @"秒"},
         @{@"label": @"日历聚合窗口", @"key": SettingCalendarWindowMinutesKey, @"values": @[@3, @5, @10], @"suffix": @"分钟"},
         @{@"label": @"最小写入块", @"key": SettingCalendarMinBlockMinutesKey, @"values": @[@3, @5, @10], @"suffix": @"分钟"}
     ];
 
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 330, 150)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 330, 190)];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.spacing = 10;
     stack.alignment = NSLayoutAttributeLeading;
@@ -6919,7 +6921,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"记录规则设置";
-    alert.informativeText = @"1 秒内切换会被原始记录忽略；下面设置只影响展示聚合和之后写入日历。";
+    alert.informativeText = @"1 秒内切换会被原始记录忽略；原始切换合并用于过滤很短的来回切换，调大后会整理今天的数据。";
     alert.accessoryView = stack;
     [alert addButtonWithTitle:@"保存"];
     [alert addButtonWithTitle:@"取消"];
@@ -6934,7 +6936,16 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     }
     [defaults synchronize];
     self.tracker.idleThreshold = IdleThresholdSetting();
-    [self updateStatus:@"设置已更新"];
+    NSTimeInterval currentRawMergeSeconds = RawMergeInterruptionSetting();
+    BOOL compactedToday = NO;
+    if (currentRawMergeSeconds > previousRawMergeSeconds && currentRawMergeSeconds > 0) {
+        NSError *compactError = nil;
+        compactedToday = [self.store compactRawURLForDate:[NSDate date] error:&compactError];
+        if (!compactedToday && compactError) {
+            NSLog(@"compact raw after settings failed: %@", compactError.localizedDescription);
+        }
+    }
+    [self updateStatus:compactedToday ? @"设置已更新，今天已整理" : @"设置已更新"];
     if (self.popover.isShown) {
         [self refreshDashboard];
     }
