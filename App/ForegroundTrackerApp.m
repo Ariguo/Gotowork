@@ -6792,6 +6792,94 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 }
 @end
 
+static NSArray<NSDictionary *> *AppFilterRowsForDate(SegmentStore *store,
+                                                      NSDate *date,
+                                                      NSSet<NSString *> *ignoredKeys,
+                                                      NSDictionary *existingMappings) {
+    NSDate *safeDate = date ?: [NSDate date];
+    NSSet *safeIgnoredKeys = ignoredKeys ?: [NSSet set];
+    NSDictionary *safeExistingMappings = [existingMappings isKindOfClass:NSDictionary.class] ? existingMappings : @{};
+    NSArray *segments = ReadRawSegmentsForAppFiltering([store rawURLForDate:safeDate]);
+    NSArray *residentSegments = ReadRawSegmentsForAppFiltering([store residentRawURLForDate:safeDate]);
+    NSDictionary *summary = AppSummaryFromSegments([segments arrayByAddingObjectsFromArray:residentSegments]);
+    NSArray *topApps = summary[@"top_apps"] ?: @[];
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *rowsByKey = [NSMutableDictionary dictionary];
+
+    for (NSDictionary *app in topApps) {
+        NSString *key = app[@"key"];
+        if (key.length == 0 || [key hasPrefix:@"__"]) {
+            continue;
+        }
+        rowsByKey[key] = [@{
+            @"key": key,
+            @"title": app[@"title"] ?: key,
+            @"bundle_id": app[@"bundle_id"] ?: @"",
+            @"seconds": app[@"seconds"] ?: @0,
+            @"suggested_filter_reason": SuggestedAppFilterReason(key, app[@"title"] ?: key, app[@"bundle_id"] ?: @"")
+        } mutableCopy];
+    }
+
+    for (NSString *key in safeIgnoredKeys) {
+        if (key.length == 0 || rowsByKey[key]) {
+            continue;
+        }
+        NSDictionary *mapping = safeExistingMappings[key];
+        NSString *title = [mapping isKindOfClass:NSDictionary.class] && [mapping[@"event_title"] length] > 0 ? mapping[@"event_title"] : key;
+        rowsByKey[key] = [@{
+            @"key": key,
+            @"title": title,
+            @"bundle_id": @"",
+            @"seconds": @0,
+            @"suggested_filter_reason": SuggestedAppFilterReason(key, title, @"")
+        } mutableCopy];
+    }
+
+    NSArray *rows = [rowsByKey.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        BOOL leftIgnored = [safeIgnoredKeys containsObject:a[@"key"]];
+        BOOL rightIgnored = [safeIgnoredKeys containsObject:b[@"key"]];
+        if (leftIgnored != rightIgnored) {
+            return leftIgnored ? NSOrderedAscending : NSOrderedDescending;
+        }
+        BOOL leftSuggested = [a[@"suggested_filter_reason"] length] > 0;
+        BOOL rightSuggested = [b[@"suggested_filter_reason"] length] > 0;
+        if (leftSuggested != rightSuggested) {
+            return leftSuggested ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [b[@"seconds"] compare:a[@"seconds"]];
+    }];
+    return rows.count > 16 ? [rows subarrayWithRange:NSMakeRange(0, 16)] : rows;
+}
+
+static void PrintAppFilterRows(NSDate *date,
+                               SegmentStore *store,
+                               NSSet<NSString *> *ignoredKeys,
+                               NSDictionary *existingMappings) {
+    NSArray<NSDictionary *> *rows = AppFilterRowsForDate(store, date, ignoredKeys, existingMappings);
+    NSInteger suggestedCount = 0;
+    for (NSDictionary *row in rows) {
+        if ([row[@"suggested_filter_reason"] length] > 0) {
+            suggestedCount++;
+        }
+    }
+    printf("date=%s rows=%ld suggested_rows=%ld ignored_rows=%ld\n",
+           [DayString(date) UTF8String],
+           (long)rows.count,
+           (long)suggestedCount,
+           (long)ignoredKeys.count);
+    for (NSDictionary *row in rows) {
+        NSString *key = row[@"key"] ?: @"";
+        NSString *title = row[@"title"] ?: key;
+        NSString *reason = row[@"suggested_filter_reason"] ?: @"";
+        BOOL ignored = [ignoredKeys containsObject:key];
+        printf("key=%s title=%s seconds=%.1f ignored=%s suggested=%s\n",
+               key.UTF8String,
+               title.UTF8String,
+               [row[@"seconds"] doubleValue],
+               ignored ? "yes" : "no",
+               reason.UTF8String);
+    }
+}
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSPopoverDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSPopover *popover;
@@ -7380,57 +7468,10 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 }
 
 - (NSArray<NSDictionary *> *)appFilterRows {
-    NSDate *dashboardDate = [self dashboardDate];
-    NSArray *segments = ReadRawSegmentsForAppFiltering([self.store rawURLForDate:dashboardDate]);
-    NSArray *residentSegments = ReadRawSegmentsForAppFiltering([self.store residentRawURLForDate:dashboardDate]);
-    NSDictionary *summary = AppSummaryFromSegments([segments arrayByAddingObjectsFromArray:residentSegments]);
-    NSArray *topApps = summary[@"top_apps"] ?: @[];
-    NSSet *ignoredKeys = [self ignoredAppKeys];
-    NSDictionary *existingMappings = [self appWriteMappingsByAppKey];
-    NSMutableDictionary<NSString *, NSMutableDictionary *> *rowsByKey = [NSMutableDictionary dictionary];
-
-    for (NSDictionary *app in topApps) {
-        NSString *key = app[@"key"];
-        if (key.length == 0 || [key hasPrefix:@"__"]) {
-            continue;
-        }
-        rowsByKey[key] = [@{
-            @"key": key,
-            @"title": app[@"title"] ?: key,
-            @"bundle_id": app[@"bundle_id"] ?: @"",
-            @"seconds": app[@"seconds"] ?: @0
-        } mutableCopy];
-    }
-
-    for (NSString *key in ignoredKeys) {
-        if (key.length == 0 || rowsByKey[key]) {
-            continue;
-        }
-        NSDictionary *mapping = existingMappings[key];
-        NSString *title = [mapping isKindOfClass:NSDictionary.class] && [mapping[@"event_title"] length] > 0 ? mapping[@"event_title"] : key;
-        rowsByKey[key] = [@{
-            @"key": key,
-            @"title": title,
-            @"bundle_id": @"",
-            @"seconds": @0,
-            @"suggested_filter_reason": SuggestedAppFilterReason(key, title, @"")
-        } mutableCopy];
-    }
-
-    NSArray *rows = [rowsByKey.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-        BOOL leftIgnored = [ignoredKeys containsObject:a[@"key"]];
-        BOOL rightIgnored = [ignoredKeys containsObject:b[@"key"]];
-        if (leftIgnored != rightIgnored) {
-            return leftIgnored ? NSOrderedAscending : NSOrderedDescending;
-        }
-        BOOL leftSuggested = [a[@"suggested_filter_reason"] length] > 0;
-        BOOL rightSuggested = [b[@"suggested_filter_reason"] length] > 0;
-        if (leftSuggested != rightSuggested) {
-            return leftSuggested ? NSOrderedAscending : NSOrderedDescending;
-        }
-        return [b[@"seconds"] compare:a[@"seconds"]];
-    }];
-    return rows.count > 16 ? [rows subarrayWithRange:NSMakeRange(0, 16)] : rows;
+    return AppFilterRowsForDate(self.store,
+                                [self dashboardDate],
+                                [self ignoredAppKeys],
+                                [self appWriteMappingsByAppKey]);
 }
 
 - (void)openAppFilters:(id)sender {
@@ -7443,6 +7484,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
     }
 
     NSMutableArray<NSDictionary *> *controls = [NSMutableArray array];
+    BOOL hasSuggestedFilters = NO;
     CGFloat rowHeight = 50.0;
     CGFloat documentHeight = MAX(72.0, apps.count * rowHeight + 16.0);
     NSView *document = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, documentHeight)];
@@ -7457,6 +7499,9 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         NSString *duration = [app[@"seconds"] doubleValue] > 0 ? ShortDuration([app[@"seconds"] doubleValue]) : @"无今日时长";
         NSString *suggestedReason = app[@"suggested_filter_reason"] ?: @"";
         BOOL ignored = [ignoredKeys containsObject:key];
+        if (suggestedReason.length > 0) {
+            hasSuggestedFilters = YES;
+        }
 
         NSStackView *row = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 400, 42)];
         row.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -7480,7 +7525,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         [row addArrangedSubview:check];
         [row addArrangedSubview:label];
         [stack addArrangedSubview:row];
-        [controls addObject:@{@"key": key, @"check": check}];
+        [controls addObject:@{@"key": key, @"check": check, @"suggested_filter_reason": suggestedReason}];
     }
 
     [document addSubview:stack];
@@ -7491,22 +7536,32 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"应用过滤";
-    alert.informativeText = @"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。";
+    alert.informativeText = hasSuggestedFilters
+        ? @"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。点“应用建议”会一次过滤系统弹窗和临时界面。"
+        : @"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。";
     alert.accessoryView = scroll;
     [alert addButtonWithTitle:@"保存"];
     [alert addButtonWithTitle:@"取消"];
+    if (hasSuggestedFilters) {
+        [alert addButtonWithTitle:@"应用建议"];
+    }
     [NSApp activateIgnoringOtherApps:YES];
-    if ([alert runModal] != NSAlertFirstButtonReturn) {
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertSecondButtonReturn) {
         return;
     }
+    BOOL applySuggestions = (response == NSAlertThirdButtonReturn);
 
     for (NSDictionary *row in controls) {
         NSString *key = row[@"key"];
         NSButton *check = row[@"check"];
+        NSString *suggestedReason = row[@"suggested_filter_reason"] ?: @"";
         if (key.length == 0) {
             continue;
         }
-        if (check.state == NSControlStateValueOn) {
+        if (applySuggestions && suggestedReason.length > 0) {
+            [ignoredKeys addObject:key];
+        } else if (check.state == NSControlStateValueOn) {
             [ignoredKeys removeObject:key];
         } else {
             [ignoredKeys addObject:key];
@@ -7515,7 +7570,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 
     [[NSUserDefaults standardUserDefaults] setObject:ignoredKeys.allObjects forKey:IgnoredAppKeysKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    [self updateStatus:@"应用过滤已更新"];
+    [self updateStatus:applySuggestions ? @"已应用建议过滤" : @"应用过滤已更新"];
     [self refreshDashboard];
 }
 
@@ -8286,6 +8341,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
     BOOL compactRaw = NO;
     BOOL dark = NO;
     BOOL dumpBlocks = NO;
+    BOOL dumpAppFilterRows = NO;
     BOOL dumpDurationDistribution = NO;
     BOOL selectFirstCalendar = NO;
     BOOL hoverFirstCalendar = NO;
@@ -8307,6 +8363,8 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             dark = YES;
         } else if ([arg isEqualToString:@"--dump-dashboard-blocks"]) {
             dumpBlocks = YES;
+        } else if ([arg isEqualToString:@"--dump-app-filter-rows"]) {
+            dumpAppFilterRows = YES;
         } else if ([arg isEqualToString:@"--dump-duration-distribution"] ||
                    [arg isEqualToString:@"--dump-segment-duration-distribution"]) {
             dumpDurationDistribution = YES;
@@ -8366,7 +8424,7 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
             }
         }
     }
-    if (outputPath.length == 0 && !dumpBlocks && !compactRaw && !dumpDurationDistribution) {
+    if (outputPath.length == 0 && !dumpBlocks && !dumpAppFilterRows && !compactRaw && !dumpDurationDistribution) {
         return -1;
     }
 
@@ -8404,6 +8462,10 @@ static int RenderDashboardPreviewIfRequested(int argc, const char *argv[]) {
         if (residentSegments.count > 0) {
             PrintDurationDistribution(previewDate, @"resident", residentSegments);
         }
+        return 0;
+    }
+    if (dumpAppFilterRows) {
+        PrintAppFilterRows(previewDate, store, IgnoredAppKeysSetting(), appWriteMappings);
         return 0;
     }
     if (previewNowClock.length > 0) {
