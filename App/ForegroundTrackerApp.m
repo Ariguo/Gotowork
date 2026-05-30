@@ -1469,6 +1469,8 @@ static BOOL DecorateSegment(NSMutableDictionary *segment) {
     return YES;
 }
 
+static NSString *DashboardDateTitle(NSDate *date);
+
 static NSArray<NSMutableDictionary *> *ReadRawSegments(NSURL *rawURL) {
     if (![[NSFileManager defaultManager] fileExistsAtPath:rawURL.path]) {
         return @[];
@@ -1670,6 +1672,28 @@ static NSString *DurationDistributionReport(NSArray<NSMutableDictionary *> *fore
         [sections addObject:DurationDistributionReportSection(@"常驻", SegmentDurationDistribution(residentSegments))];
     }
     return [sections componentsJoinedByString:@"\n\n"];
+}
+
+static NSString *DurationDistributionSettingsSummary(NSDate *date, NSDictionary *distribution) {
+    NSArray *buckets = distribution[@"buckets"] ?: @[];
+    NSInteger oneToTwo = buckets.count > 1 ? [buckets[1][@"count"] integerValue] : 0;
+    NSInteger twoToFive = buckets.count > 2 ? [buckets[2][@"count"] integerValue] : 0;
+    NSInteger fiveToTen = buckets.count > 3 ? [buckets[3][@"count"] integerValue] : 0;
+    NSInteger absorbedCount = [distribution[@"absorbed_short_interruption_count"] integerValue];
+    double absorbedSeconds = [distribution[@"absorbed_short_interruption_seconds"] doubleValue];
+    NSInteger recordedCount = [distribution[@"recorded_segment_count"] integerValue];
+    if (recordedCount == 0) {
+        return [NSString stringWithFormat:@"%@还没有可统计的片段。", DashboardDateTitle(date)];
+    }
+    NSString *absorbed = absorbedCount > 0
+        ? [NSString stringWithFormat:@"，已合并 %ld 次/%@", (long)absorbedCount, ShortDuration(absorbedSeconds)]
+        : @"";
+    return [NSString stringWithFormat:@"%@碎片：1-2s %ld 段，2-5s %ld 段，5-10s %ld 段%@。",
+            DashboardDateTitle(date),
+            (long)oneToTwo,
+            (long)twoToFive,
+            (long)fiveToTen,
+            absorbed];
 }
 
 static void PrintDurationDistribution(NSDate *date,
@@ -7123,6 +7147,8 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
 - (void)openSettings:(id)sender {
     NSMutableDictionary<NSString *, NSPopUpButton *> *popups = [NSMutableDictionary dictionary];
     NSTimeInterval previousRawMergeSeconds = RawMergeInterruptionSetting();
+    NSDate *summaryDate = [self dashboardDate];
+    NSDictionary *durationDistribution = SegmentDurationDistribution(ReadRawSegmentsIncludingShort([self.store rawURLForDate:summaryDate]));
     NSArray *rows = @[
         @{@"label": @"idle 判定", @"key": SettingIdleSecondsKey, @"values": @[@60, @120, @300], @"suffix": @"秒"},
         @{@"label": @"原始切换合并", @"key": SettingRawMergeInterruptionSecondsKey, @"values": @[@0, @1, @2, @3, @5], @"suffix": @"秒"},
@@ -7131,7 +7157,7 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         @{@"label": @"最小写入块", @"key": SettingCalendarMinBlockMinutesKey, @"values": @[@3, @5, @10], @"suffix": @"分钟"}
     ];
 
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 330, 190)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 330, 224)];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.spacing = 10;
     stack.alignment = NSLayoutAttributeLeading;
@@ -7149,6 +7175,12 @@ static BOOL CalendarStatusAllowsFullAccess(EKAuthorizationStatus status) {
         [stack addArrangedSubview:line];
         popups[row[@"key"]] = popup;
     }
+
+    NSTextField *summary = [NSTextField wrappingLabelWithString:DurationDistributionSettingsSummary(summaryDate, durationDistribution)];
+    summary.font = [NSFont systemFontOfSize:11];
+    summary.textColor = [NSColor secondaryLabelColor];
+    summary.frame = NSMakeRect(0, 0, 320, 34);
+    [stack addArrangedSubview:summary];
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"记录规则设置";
