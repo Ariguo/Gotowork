@@ -6880,6 +6880,287 @@ static void PrintAppFilterRows(NSDate *date,
     }
 }
 
+typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOOL appliedSuggestions);
+
+@interface AppFilterSettingsController : NSWindowController <NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate>
+@property(nonatomic, copy) NSArray<NSDictionary *> *allRows;
+@property(nonatomic, copy) NSArray<NSDictionary *> *visibleRows;
+@property(nonatomic, strong) NSMutableSet<NSString *> *ignoredKeys;
+@property(nonatomic, strong) NSTableView *tableView;
+@property(nonatomic, strong) NSSearchField *searchField;
+@property(nonatomic, strong) NSTextField *summaryLabel;
+@property(nonatomic, copy) AppFilterSettingsSaveHandler saveHandler;
+@property(nonatomic, assign) BOOL didApplySuggestions;
+- (instancetype)initWithRows:(NSArray<NSDictionary *> *)rows
+                 ignoredKeys:(NSSet<NSString *> *)ignoredKeys
+                 saveHandler:(AppFilterSettingsSaveHandler)saveHandler;
+@end
+
+@implementation AppFilterSettingsController
+
+- (instancetype)initWithRows:(NSArray<NSDictionary *> *)rows
+                 ignoredKeys:(NSSet<NSString *> *)ignoredKeys
+                 saveHandler:(AppFilterSettingsSaveHandler)saveHandler {
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 680, 500)
+                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    self = [super initWithWindow:panel];
+    if (self) {
+        _allRows = [rows copy] ?: @[];
+        _visibleRows = _allRows;
+        _ignoredKeys = [ignoredKeys mutableCopy] ?: [NSMutableSet set];
+        _saveHandler = [saveHandler copy];
+        panel.title = @"应用过滤";
+        panel.minSize = NSMakeSize(560, 380);
+        panel.releasedWhenClosed = NO;
+        [self buildInterface];
+        [self updateSummary];
+    }
+    return self;
+}
+
+- (void)buildInterface {
+    NSView *content = self.window.contentView;
+    content.wantsLayer = YES;
+    content.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+
+    NSTextField *title = [NSTextField labelWithString:@"应用过滤"];
+    title.font = [NSFont systemFontOfSize:22 weight:NSFontWeightSemibold];
+    title.frame = NSMakeRect(24, 452, 180, 28);
+    title.autoresizingMask = NSViewMinYMargin;
+    [content addSubview:title];
+
+    NSTextField *info = [NSTextField wrappingLabelWithString:@"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。"];
+    info.font = [NSFont systemFontOfSize:12];
+    info.textColor = NSColor.secondaryLabelColor;
+    info.frame = NSMakeRect(24, 420, 632, 32);
+    info.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [content addSubview:info];
+
+    self.searchField = [[NSSearchField alloc] initWithFrame:NSMakeRect(24, 382, 290, 28)];
+    self.searchField.placeholderString = @"搜索应用或标识";
+    self.searchField.delegate = self;
+    self.searchField.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    [content addSubview:self.searchField];
+
+    NSButton *suggestButton = [NSButton buttonWithTitle:@"应用建议" target:self action:@selector(applySuggestedFilters:)];
+    suggestButton.bezelStyle = NSBezelStyleRounded;
+    suggestButton.enabled = [self suggestedRowCount] > 0;
+    suggestButton.frame = NSMakeRect(326, 382, 92, 28);
+    suggestButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    [content addSubview:suggestButton];
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(24, 78, 632, 292)];
+    scroll.hasVerticalScroller = YES;
+    scroll.borderType = NSBezelBorder;
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    self.tableView = [[NSTableView alloc] initWithFrame:scroll.bounds];
+    self.tableView.delegate = self;
+    self.tableView.dataSource = self;
+    self.tableView.rowHeight = 34.0;
+    self.tableView.usesAlternatingRowBackgroundColors = YES;
+    self.tableView.allowsColumnResizing = YES;
+
+    NSTableColumn *enabledColumn = [[NSTableColumn alloc] initWithIdentifier:@"enabled"];
+    enabledColumn.title = @"统计";
+    enabledColumn.width = 56;
+    enabledColumn.minWidth = 48;
+    enabledColumn.maxWidth = 64;
+    [self.tableView addTableColumn:enabledColumn];
+
+    NSTableColumn *appColumn = [[NSTableColumn alloc] initWithIdentifier:@"app"];
+    appColumn.title = @"应用";
+    appColumn.width = 160;
+    appColumn.minWidth = 120;
+    [self.tableView addTableColumn:appColumn];
+
+    NSTableColumn *durationColumn = [[NSTableColumn alloc] initWithIdentifier:@"duration"];
+    durationColumn.title = @"今日";
+    durationColumn.width = 82;
+    durationColumn.minWidth = 70;
+    [self.tableView addTableColumn:durationColumn];
+
+    NSTableColumn *keyColumn = [[NSTableColumn alloc] initWithIdentifier:@"key"];
+    keyColumn.title = @"标识";
+    keyColumn.width = 190;
+    keyColumn.minWidth = 120;
+    [self.tableView addTableColumn:keyColumn];
+
+    NSTableColumn *reasonColumn = [[NSTableColumn alloc] initWithIdentifier:@"reason"];
+    reasonColumn.title = @"建议";
+    reasonColumn.width = 128;
+    reasonColumn.minWidth = 90;
+    [self.tableView addTableColumn:reasonColumn];
+
+    scroll.documentView = self.tableView;
+    [content addSubview:scroll];
+
+    self.summaryLabel = [NSTextField labelWithString:@""];
+    self.summaryLabel.font = [NSFont systemFontOfSize:12];
+    self.summaryLabel.textColor = NSColor.secondaryLabelColor;
+    self.summaryLabel.frame = NSMakeRect(24, 42, 360, 18);
+    self.summaryLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [content addSubview:self.summaryLabel];
+
+    NSButton *cancelButton = [NSButton buttonWithTitle:@"取消" target:self action:@selector(cancel:)];
+    cancelButton.bezelStyle = NSBezelStyleRounded;
+    cancelButton.frame = NSMakeRect(474, 24, 82, 30);
+    cancelButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [content addSubview:cancelButton];
+
+    NSButton *saveButton = [NSButton buttonWithTitle:@"保存" target:self action:@selector(save:)];
+    saveButton.bezelStyle = NSBezelStyleRounded;
+    saveButton.keyEquivalent = @"\r";
+    saveButton.frame = NSMakeRect(570, 24, 86, 30);
+    saveButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [content addSubview:saveButton];
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    return self.visibleRows.count;
+}
+
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+    NSDictionary *app = row >= 0 && row < (NSInteger)self.visibleRows.count ? self.visibleRows[row] : @{};
+    NSString *identifier = tableColumn.identifier;
+    NSString *key = app[@"key"] ?: @"";
+
+    if ([identifier isEqualToString:@"enabled"]) {
+        NSButton *check = [tableView makeViewWithIdentifier:@"enabledCheck" owner:self];
+        if (!check) {
+            check = [NSButton checkboxWithTitle:@"" target:self action:@selector(toggleIncluded:)];
+            check.identifier = @"enabledCheck";
+        }
+        check.tag = row;
+        check.state = [self.ignoredKeys containsObject:key] ? NSControlStateValueOff : NSControlStateValueOn;
+        return check;
+    }
+
+    NSString *text = @"";
+    NSColor *textColor = NSColor.labelColor;
+    NSFont *font = [NSFont systemFontOfSize:12];
+    if ([identifier isEqualToString:@"app"]) {
+        text = app[@"title"] ?: key;
+        font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    } else if ([identifier isEqualToString:@"duration"]) {
+        double seconds = [app[@"seconds"] doubleValue];
+        text = seconds > 0 ? ShortDuration(seconds) : @"无";
+        textColor = NSColor.secondaryLabelColor;
+    } else if ([identifier isEqualToString:@"key"]) {
+        text = key;
+        textColor = NSColor.secondaryLabelColor;
+    } else if ([identifier isEqualToString:@"reason"]) {
+        NSString *reason = app[@"suggested_filter_reason"] ?: @"";
+        text = reason.length > 0 ? reason : @"";
+        textColor = reason.length > 0 ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor;
+    }
+
+    NSTextField *label = [tableView makeViewWithIdentifier:identifier owner:self];
+    if (!label) {
+        label = [NSTextField labelWithString:@""];
+        label.identifier = identifier;
+        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    }
+    label.stringValue = text;
+    label.textColor = textColor;
+    label.font = font;
+    return label;
+}
+
+- (void)toggleIncluded:(NSButton *)sender {
+    NSInteger row = sender.tag;
+    if (row < 0 || row >= (NSInteger)self.visibleRows.count) {
+        return;
+    }
+    NSString *key = self.visibleRows[row][@"key"] ?: @"";
+    if (key.length == 0) {
+        return;
+    }
+    if (sender.state == NSControlStateValueOn) {
+        [self.ignoredKeys removeObject:key];
+    } else {
+        [self.ignoredKeys addObject:key];
+    }
+    [self updateSummary];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    [self applySearchFilter];
+}
+
+- (void)applySearchFilter {
+    NSString *query = self.searchField.stringValue ?: @"";
+    if (query.length == 0) {
+        self.visibleRows = self.allRows;
+    } else {
+        NSMutableArray *matches = [NSMutableArray array];
+        for (NSDictionary *row in self.allRows) {
+            NSString *haystack = [NSString stringWithFormat:@"%@ %@ %@ %@",
+                                  row[@"title"] ?: @"",
+                                  row[@"key"] ?: @"",
+                                  row[@"bundle_id"] ?: @"",
+                                  row[@"suggested_filter_reason"] ?: @""];
+            if ([haystack rangeOfString:query options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [matches addObject:row];
+            }
+        }
+        self.visibleRows = matches;
+    }
+    [self.tableView reloadData];
+    [self updateSummary];
+}
+
+- (NSInteger)suggestedRowCount {
+    NSInteger count = 0;
+    for (NSDictionary *row in self.allRows) {
+        if ([row[@"suggested_filter_reason"] length] > 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+- (void)applySuggestedFilters:(id)sender {
+    self.didApplySuggestions = YES;
+    for (NSDictionary *row in self.allRows) {
+        NSString *key = row[@"key"] ?: @"";
+        if (key.length > 0 && [row[@"suggested_filter_reason"] length] > 0) {
+            [self.ignoredKeys addObject:key];
+        }
+    }
+    [self.tableView reloadData];
+    [self updateSummary];
+}
+
+- (void)updateSummary {
+    NSInteger visibleIgnored = 0;
+    for (NSDictionary *row in self.visibleRows) {
+        NSString *key = row[@"key"] ?: @"";
+        if ([self.ignoredKeys containsObject:key]) {
+            visibleIgnored++;
+        }
+    }
+    self.summaryLabel.stringValue = [NSString stringWithFormat:@"显示 %ld 个应用，已过滤 %ld 个；建议 %ld 个。保存后生效。",
+                                     (long)self.visibleRows.count,
+                                     (long)visibleIgnored,
+                                     (long)[self suggestedRowCount]];
+}
+
+- (void)cancel:(id)sender {
+    [self close];
+}
+
+- (void)save:(id)sender {
+    if (self.saveHandler) {
+        self.saveHandler([self.ignoredKeys copy], self.didApplySuggestions);
+    }
+    [self close];
+}
+
+@end
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSPopoverDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSPopover *popover;
@@ -6890,6 +7171,7 @@ static void PrintAppFilterRows(NSDate *date,
 @property(nonatomic, strong) NSTimer *dashboardRefreshTimer;
 @property(nonatomic, strong) NSDate *selectedDashboardDate;
 @property(nonatomic, copy) NSString *lastStatus;
+@property(nonatomic, strong) AppFilterSettingsController *appFilterSettingsController;
 @end
 
 @implementation AppDelegate
@@ -7476,102 +7758,29 @@ static void PrintAppFilterRows(NSDate *date,
 
 - (void)openAppFilters:(id)sender {
     NSArray<NSDictionary *> *apps = [self appFilterRows];
-    NSMutableSet<NSString *> *ignoredKeys = [[self ignoredAppKeys] mutableCopy] ?: [NSMutableSet set];
     if (apps.count == 0) {
         [self showAlertWithTitle:@"还没有可过滤的应用"
                          message:@"Gotowork 需要先记录到一些前台应用，才会在这里显示应用过滤。"];
         return;
     }
 
-    NSMutableArray<NSDictionary *> *controls = [NSMutableArray array];
-    BOOL hasSuggestedFilters = NO;
-    CGFloat rowHeight = 50.0;
-    CGFloat documentHeight = MAX(72.0, apps.count * rowHeight + 16.0);
-    NSView *document = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, documentHeight)];
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(10, 8, 400, documentHeight - 16)];
-    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    stack.spacing = 8;
-    stack.alignment = NSLayoutAttributeLeading;
-
-    for (NSDictionary *app in apps) {
-        NSString *key = app[@"key"] ?: @"";
-        NSString *title = app[@"title"] ?: key;
-        NSString *duration = [app[@"seconds"] doubleValue] > 0 ? ShortDuration([app[@"seconds"] doubleValue]) : @"无今日时长";
-        NSString *suggestedReason = app[@"suggested_filter_reason"] ?: @"";
-        BOOL ignored = [ignoredKeys containsObject:key];
-        if (suggestedReason.length > 0) {
-            hasSuggestedFilters = YES;
+    __weak AppDelegate *weakSelf = self;
+    self.appFilterSettingsController = [[AppFilterSettingsController alloc] initWithRows:apps
+                                                                             ignoredKeys:[self ignoredAppKeys]
+                                                                             saveHandler:^(NSSet<NSString *> *ignoredKeys, BOOL appliedSuggestions) {
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
         }
-
-        NSStackView *row = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 400, 42)];
-        row.orientation = NSUserInterfaceLayoutOrientationVertical;
-        row.spacing = 3;
-
-        NSButton *check = [NSButton checkboxWithTitle:[NSString stringWithFormat:@"%@  %@", title, duration]
-                                               target:nil
-                                               action:nil];
-        check.state = ignored ? NSControlStateValueOff : NSControlStateValueOn;
-        check.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-
-        NSString *detail = suggestedReason.length > 0
-            ? [NSString stringWithFormat:@"%@ · 建议过滤：%@", key, suggestedReason]
-            : key;
-        NSTextField *label = [NSTextField labelWithString:detail];
-        label.font = [NSFont systemFontOfSize:10];
-        label.textColor = [NSColor secondaryLabelColor];
-        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        label.frame = NSMakeRect(22, 0, 370, 14);
-
-        [row addArrangedSubview:check];
-        [row addArrangedSubview:label];
-        [stack addArrangedSubview:row];
-        [controls addObject:@{@"key": key, @"check": check, @"suggested_filter_reason": suggestedReason}];
-    }
-
-    [document addSubview:stack];
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 440, 320)];
-    scroll.hasVerticalScroller = YES;
-    scroll.borderType = NSBezelBorder;
-    scroll.documentView = document;
-
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"应用过滤";
-    alert.informativeText = hasSuggestedFilters
-        ? @"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。点“应用建议”会一次过滤系统弹窗和临时界面。"
-        : @"取消勾选后，这个应用不进入统计、片段分布和日历候选；raw 记录仍保留。";
-    alert.accessoryView = scroll;
-    [alert addButtonWithTitle:@"保存"];
-    [alert addButtonWithTitle:@"取消"];
-    if (hasSuggestedFilters) {
-        [alert addButtonWithTitle:@"应用建议"];
-    }
+        [[NSUserDefaults standardUserDefaults] setObject:ignoredKeys.allObjects forKey:IgnoredAppKeysKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        [strongSelf updateStatus:appliedSuggestions ? @"已应用建议过滤" : @"应用过滤已更新"];
+        [strongSelf refreshDashboard];
+    }];
     [NSApp activateIgnoringOtherApps:YES];
-    NSModalResponse response = [alert runModal];
-    if (response == NSAlertSecondButtonReturn) {
-        return;
-    }
-    BOOL applySuggestions = (response == NSAlertThirdButtonReturn);
-
-    for (NSDictionary *row in controls) {
-        NSString *key = row[@"key"];
-        NSButton *check = row[@"check"];
-        NSString *suggestedReason = row[@"suggested_filter_reason"] ?: @"";
-        if (key.length == 0) {
-            continue;
-        }
-        if (applySuggestions && suggestedReason.length > 0) {
-            [ignoredKeys addObject:key];
-        } else if (check.state == NSControlStateValueOn) {
-            [ignoredKeys removeObject:key];
-        } else {
-            [ignoredKeys addObject:key];
-        }
-    }
-
-    [[NSUserDefaults standardUserDefaults] setObject:ignoredKeys.allObjects forKey:IgnoredAppKeysKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    [self updateStatus:applySuggestions ? @"已应用建议过滤" : @"应用过滤已更新"];
-    [self refreshDashboard];
+    [self.appFilterSettingsController.window center];
+    [self.appFilterSettingsController showWindow:nil];
+    [self.appFilterSettingsController.window makeKeyAndOrderFront:nil];
 }
 
 - (void)openAppWriteMappings:(id)sender {
