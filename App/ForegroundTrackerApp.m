@@ -47,6 +47,8 @@ static NSString * const SettingShortInterruptionSecondsKey = @"short_interruptio
 static NSString * const SettingRawMergeInterruptionSecondsKey = @"raw_merge_interruption_seconds";
 static NSString * const SettingCalendarWindowMinutesKey = @"calendar_window_minutes";
 static NSString * const SettingCalendarMinBlockMinutesKey = @"calendar_min_block_minutes";
+static NSString * const SettingAutoCalendarWriteHourKey = @"auto_calendar_write_hour";
+static NSString * const AutoCalendarLastRunDayKey = @"auto_calendar_last_run_day";
 static NSString * const TargetCalendarIdentifierKey = @"target_calendar_identifier";
 static NSString * const IgnoredCalendarBlockKeysKey = @"ignored_calendar_block_keys";
 static NSString * const IgnoredAppKeysKey = @"ignored_app_keys";
@@ -68,7 +70,8 @@ static void RegisterDefaultSettings(void) {
         SettingShortInterruptionSecondsKey: @30.0,
         SettingRawMergeInterruptionSecondsKey: @2.0,
         SettingCalendarWindowMinutesKey: @3.0,
-        SettingCalendarMinBlockMinutesKey: @5.0
+        SettingCalendarMinBlockMinutesKey: @5.0,
+        SettingAutoCalendarWriteHourKey: @-1.0
     }];
 }
 
@@ -95,6 +98,19 @@ static NSTimeInterval CalendarWindowSecondsSetting(void) {
 
 static NSTimeInterval CalendarMinBlockSecondsSetting(void) {
     return SettingDouble(SettingCalendarMinBlockMinutesKey, 5.0) * 60.0;
+}
+
+static double AutoCalendarWriteHourSetting(void) {
+    return SettingDouble(SettingAutoCalendarWriteHourKey, -1.0);
+}
+
+static BOOL AutoCalendarWriteEnabled(void) {
+    return AutoCalendarWriteHourSetting() >= 0;
+}
+
+static NSString *AutoCalendarWriteSummary(void) {
+    double hour = AutoCalendarWriteHourSetting();
+    return hour >= 0 ? [NSString stringWithFormat:@"每天 %.0f:00 后自动写入", hour] : @"自动写入已关闭";
 }
 
 static NSString *CalendarRuleSummary(void) {
@@ -1827,6 +1843,16 @@ static NSDate *DateByAddingDays(NSDate *date, NSInteger days) {
                                                     value:days
                                                    toDate:date ?: [NSDate date]
                                                   options:0];
+}
+
+static NSDate *DateOnDayAtHour(NSDate *day, NSInteger hour) {
+    NSCalendar *calendar = [NSCalendar currentCalendar];
+    NSDateComponents *components = [calendar components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay
+                                               fromDate:CalendarStartOfDay(day)];
+    components.hour = MAX(0, MIN(23, hour));
+    components.minute = 0;
+    components.second = 0;
+    return [calendar dateFromComponents:components] ?: CalendarStartOfDay(day);
 }
 
 static NSDate *StartOfWeekForDate(NSDate *date) {
@@ -7169,6 +7195,7 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
 @property(nonatomic, strong) TrackerController *tracker;
 @property(nonatomic, strong) EKEventStore *eventStore;
 @property(nonatomic, strong) NSTimer *dashboardRefreshTimer;
+@property(nonatomic, strong) NSTimer *autoCalendarWriteTimer;
 @property(nonatomic, strong) NSDate *selectedDashboardDate;
 @property(nonatomic, copy) NSString *lastStatus;
 @property(nonatomic, strong) AppFilterSettingsController *appFilterSettingsController;
@@ -7203,6 +7230,7 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
     [self.tracker start];
     [self refreshDashboard];
     [self refreshMenu];
+    [self scheduleAutoCalendarWriteTimer];
 }
 
 - (NSURL *)applicationSupportDirectory {
@@ -7405,6 +7433,127 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
     }];
 }
 
+- (NSDate *)nextAutoCalendarWriteFireDateAfter:(NSDate *)date {
+    if (!AutoCalendarWriteEnabled()) {
+        return nil;
+    }
+    NSDate *now = date ?: [NSDate date];
+    NSInteger hour = (NSInteger)llround(AutoCalendarWriteHourSetting());
+    NSDate *today = CalendarStartOfDay(now);
+    NSDate *todayFire = DateOnDayAtHour(today, hour);
+    NSString *lastRunDay = [[NSUserDefaults standardUserDefaults] stringForKey:AutoCalendarLastRunDayKey] ?: @"";
+    if ([now compare:todayFire] == NSOrderedAscending) {
+        return todayFire;
+    }
+    if (![lastRunDay isEqualToString:DayString(today)]) {
+        return [now dateByAddingTimeInterval:5.0];
+    }
+    return DateOnDayAtHour(DateByAddingDays(today, 1), hour);
+}
+
+- (void)scheduleAutoCalendarWriteTimer {
+    [self.autoCalendarWriteTimer invalidate];
+    self.autoCalendarWriteTimer = nil;
+    NSDate *fireDate = [self nextAutoCalendarWriteFireDateAfter:[NSDate date]];
+    if (!fireDate) {
+        return;
+    }
+
+    NSTimeInterval interval = MAX(1.0, [fireDate timeIntervalSinceNow]);
+    __weak AppDelegate *weakSelf = self;
+    self.autoCalendarWriteTimer = [NSTimer timerWithTimeInterval:interval repeats:NO block:^(NSTimer *timer) {
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        strongSelf.autoCalendarWriteTimer = nil;
+        [strongSelf runAutoCalendarWriteIfDue];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:self.autoCalendarWriteTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)markAutoCalendarWriteRunForDay:(NSDate *)day {
+    [[NSUserDefaults standardUserDefaults] setObject:DayString(day ?: [NSDate date]) forKey:AutoCalendarLastRunDayKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self scheduleAutoCalendarWriteTimer];
+}
+
+- (NSArray *)pendingCalendarCandidatesForDay:(NSDate *)day checkpointReason:(NSString *)checkpointReason {
+    NSDate *dashboardDate = CalendarStartOfDay(day ?: [NSDate date]);
+    if (checkpointReason.length > 0 && SameDay(dashboardDate, [NSDate date])) {
+        [self.tracker checkpointWithReason:checkpointReason];
+    }
+    BOOL selectedIsToday = SameDay(dashboardDate, [NSDate date]);
+    NSArray *segments = ReadSegmentsForRange(self.store,
+                                             dashboardDate,
+                                             DateByAddingDays(dashboardDate, 1),
+                                             selectedIsToday ? [self.tracker currentDashboardSegment] : nil);
+    NSArray *residentSegments = ReadResidentSegmentsForRange(self.store,
+                                                             dashboardDate,
+                                                             DateByAddingDays(dashboardDate, 1),
+                                                             selectedIsToday ? [self.tracker currentResidentMeetingSegment] : nil);
+    NSSet<NSString *> *existingKeys = [self existingCalendarBlockKeysForDay:dashboardDate];
+    NSSet<NSString *> *ignoredKeys = [self ignoredCalendarBlockKeys];
+    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments,
+                                                                                       residentSegments,
+                                                                                       [self manualCalendarBlockRecords],
+                                                                                       dashboardDate),
+                                                      existingKeys,
+                                                      ignoredKeys,
+                                                      [self appWriteMappingsByAppKey],
+                                                      [self projectLabelsByBlockKey],
+                                                      [self blockTitlesByBlockKey]);
+    return PendingCalendarCandidates(candidates, existingKeys, ignoredKeys);
+}
+
+- (void)runAutoCalendarWriteIfDue {
+    if (!AutoCalendarWriteEnabled()) {
+        return;
+    }
+    NSDate *now = [NSDate date];
+    NSDate *today = CalendarStartOfDay(now);
+    NSDate *fireDate = DateOnDayAtHour(today, (NSInteger)llround(AutoCalendarWriteHourSetting()));
+    NSString *lastRunDay = [[NSUserDefaults standardUserDefaults] stringForKey:AutoCalendarLastRunDayKey] ?: @"";
+    if ([now compare:fireDate] == NSOrderedAscending || [lastRunDay isEqualToString:DayString(today)]) {
+        [self scheduleAutoCalendarWriteTimer];
+        return;
+    }
+
+    if (!CalendarStatusAllowsFullAccess([EKEventStore authorizationStatusForEntityType:EKEntityTypeEvent])) {
+        [self updateStatus:@"自动写入需要日历权限"];
+        [self markAutoCalendarWriteRunForDay:today];
+        return;
+    }
+
+    NSArray *candidates = [self pendingCalendarCandidatesForDay:today checkpointReason:@"auto-calendar-export"];
+    if (candidates.count == 0) {
+        [self updateStatus:@"自动写入：没有新的日历块"];
+        [self markAutoCalendarWriteRunForDay:today];
+        [self refreshDashboard];
+        return;
+    }
+
+    NSError *writeError = nil;
+    NSDictionary *result = [self writeCalendarBlocks:candidates day:today error:&writeError];
+    if (!result) {
+        [self updateStatus:@"自动写入日历失败"];
+        NSLog(@"auto calendar write failed: %@", writeError.localizedDescription ?: @"unknown error");
+        [self markAutoCalendarWriteRunForDay:today];
+        [self refreshDashboard];
+        return;
+    }
+
+    NSInteger written = [result[@"written"] integerValue];
+    NSInteger skipped = [result[@"skipped"] integerValue];
+    NSString *status = skipped > 0
+        ? [NSString stringWithFormat:@"自动写入 %ld 条，跳过 %ld 条", (long)written, (long)skipped]
+        : [NSString stringWithFormat:@"自动写入 %ld 条日历", (long)written];
+    [self updateStatus:status];
+    [self markAutoCalendarWriteRunForDay:today];
+    [self refreshDashboard];
+    [self flashWrittenBlockKeys:result[@"written_keys"]];
+}
+
 - (void)popoverDidClose:(NSNotification *)notification {
     [self.dashboardRefreshTimer invalidate];
     self.dashboardRefreshTimer = nil;
@@ -7438,7 +7587,8 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
         @[@"设置", NSStringFromSelector(@selector(openSettings:))],
         @[@"片段分布", NSStringFromSelector(@selector(openDurationDistribution:))],
         @[@"应用过滤", NSStringFromSelector(@selector(openAppFilters:))],
-        @[@"写入日历", NSStringFromSelector(@selector(openCalendarSettings:))],
+        @[@"预览写入今天", NSStringFromSelector(@selector(writeTodayCalendar:))],
+        @[@"日历设置", NSStringFromSelector(@selector(openCalendarSettings:))],
         @[@"应用写入映射", NSStringFromSelector(@selector(openAppWriteMappings:))],
         @[@"打开数据目录", NSStringFromSelector(@selector(openDataFolder:))],
         @[@"检查权限", NSStringFromSelector(@selector(requestPermission:))],
@@ -7554,6 +7704,7 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
 - (void)openSettings:(id)sender {
     NSMutableDictionary<NSString *, NSPopUpButton *> *popups = [NSMutableDictionary dictionary];
     NSTimeInterval previousRawMergeSeconds = RawMergeInterruptionSetting();
+    double previousAutoCalendarHour = AutoCalendarWriteHourSetting();
     NSDate *summaryDate = [self dashboardDate];
     NSDictionary *durationDistribution = SegmentDurationDistribution(ReadRawSegmentsIncludingShort([self.store rawURLForDate:summaryDate]));
     NSArray *rows = @[
@@ -7561,10 +7712,11 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
         @{@"label": @"原始切换合并", @"key": SettingRawMergeInterruptionSecondsKey, @"values": @[@0, @1, @2, @3, @5], @"suffix": @"秒"},
         @{@"label": @"短打断吸收", @"key": SettingShortInterruptionSecondsKey, @"values": @[@15, @30, @60], @"suffix": @"秒"},
         @{@"label": @"日历聚合窗口", @"key": SettingCalendarWindowMinutesKey, @"values": @[@3, @5, @10], @"suffix": @"分钟"},
-        @{@"label": @"最小写入块", @"key": SettingCalendarMinBlockMinutesKey, @"values": @[@3, @5, @10], @"suffix": @"分钟"}
+        @{@"label": @"最小写入块", @"key": SettingCalendarMinBlockMinutesKey, @"values": @[@3, @5, @10], @"suffix": @"分钟"},
+        @{@"label": @"自动写入日历", @"key": SettingAutoCalendarWriteHourKey, @"values": @[@-1, @22, @23], @"suffix": @"点后"}
     ];
 
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 330, 224)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 330, 292)];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.spacing = 10;
     stack.alignment = NSLayoutAttributeLeading;
@@ -7583,15 +7735,16 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
         popups[row[@"key"]] = popup;
     }
 
-    NSTextField *summary = [NSTextField wrappingLabelWithString:DurationDistributionSettingsSummary(summaryDate, durationDistribution)];
+    NSString *settingsSummary = [NSString stringWithFormat:@"%@\n%@", DurationDistributionSettingsSummary(summaryDate, durationDistribution), AutoCalendarWriteSummary()];
+    NSTextField *summary = [NSTextField wrappingLabelWithString:settingsSummary];
     summary.font = [NSFont systemFontOfSize:11];
     summary.textColor = [NSColor secondaryLabelColor];
-    summary.frame = NSMakeRect(0, 0, 320, 34);
+    summary.frame = NSMakeRect(0, 0, 320, 48);
     [stack addArrangedSubview:summary];
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"记录规则设置";
-    alert.informativeText = @"1 秒内切换会被原始记录忽略；原始切换合并用于过滤很短的来回切换，调大后会整理今天的数据。";
+    alert.informativeText = @"自动写入默认关闭；打开后，Gotowork 运行时会在设定时间后每天写入一次当天未确认的新时段。";
     alert.accessoryView = stack;
     [alert addButtonWithTitle:@"保存"];
     [alert addButtonWithTitle:@"取消"];
@@ -7606,6 +7759,11 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
     }
     [defaults synchronize];
     self.tracker.idleThreshold = IdleThresholdSetting();
+    if (AutoCalendarWriteHourSetting() != previousAutoCalendarHour) {
+        [defaults removeObjectForKey:AutoCalendarLastRunDayKey];
+        [defaults synchronize];
+    }
+    [self scheduleAutoCalendarWriteTimer];
     NSTimeInterval currentRawMergeSeconds = RawMergeInterruptionSetting();
     BOOL compactedToday = NO;
     if (currentRawMergeSeconds > previousRawMergeSeconds && currentRawMergeSeconds > 0) {
@@ -7616,6 +7774,14 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
         }
     }
     [self updateStatus:compactedToday ? @"设置已更新，今天已整理" : @"设置已更新"];
+    if (AutoCalendarWriteEnabled()) {
+        [self requestCalendarAccessWithCompletion:^(BOOL granted, NSError *error) {
+            if (!granted) {
+                [self showAlertWithTitle:@"自动写入需要日历权限"
+                                 message:error.localizedDescription ?: @"请允许 Gotowork 完整访问日历，才能自动写入并跳过重复事件。"];
+            }
+        }];
+    }
     if (self.popover.isShown) {
         [self refreshDashboard];
     }
@@ -7968,21 +8134,7 @@ typedef void (^AppFilterSettingsSaveHandler)(NSSet<NSString *> *ignoredKeys, BOO
 
 - (void)writeDashboardPendingBlocksToCalendar:(id)sender {
     NSDate *dashboardDate = [self dashboardDate];
-    if (SameDay(dashboardDate, [NSDate date])) {
-        [self.tracker checkpointWithReason:@"calendar-export"];
-    }
-    BOOL selectedIsToday = SameDay(dashboardDate, [NSDate date]);
-    NSArray *segments = ReadSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), selectedIsToday ? [self.tracker currentDashboardSegment] : nil);
-    NSArray *residentSegments = ReadResidentSegmentsForRange(self.store, dashboardDate, DateByAddingDays(dashboardDate, 1), selectedIsToday ? [self.tracker currentResidentMeetingSegment] : nil);
-    NSSet<NSString *> *existingKeys = [self existingCalendarBlockKeysForDay:dashboardDate];
-    NSSet<NSString *> *ignoredKeys = [self ignoredCalendarBlockKeys];
-    NSArray *candidates = CalendarCandidatesWithState(CalendarCandidatesIncludingManual(segments, residentSegments, [self manualCalendarBlockRecords], dashboardDate),
-                                                      existingKeys,
-                                                      ignoredKeys,
-                                                      [self appWriteMappingsByAppKey],
-                                                      [self projectLabelsByBlockKey],
-                                                      [self blockTitlesByBlockKey]);
-    candidates = PendingCalendarCandidates(candidates, existingKeys, ignoredKeys);
+    NSArray *candidates = [self pendingCalendarCandidatesForDay:dashboardDate checkpointReason:@"calendar-export"];
     if (candidates.count == 0) {
         [self updateStatus:@"没有新的日历块"];
         [self showAlertWithTitle:@"没有新的日历块"
