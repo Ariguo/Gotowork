@@ -62,6 +62,10 @@ static NSTimeInterval MinimumRecordedSegmentSeconds(void) {
     return 1.0;
 }
 
+static NSTimeInterval MixedWorkMergeGapSeconds(void) {
+    return 120.0;
+}
+
 static NSSet<NSString *> *TemporaryIgnoredAppKeys = nil;
 
 static void RegisterDefaultSettings(void) {
@@ -2452,8 +2456,29 @@ static NSMutableDictionary *MergedMixedActivityBlock(NSDictionary *left,
     return merged;
 }
 
+static BOOL IntervalOverlapsAnyBlock(NSDate *start, NSDate *end, NSArray *blocks) {
+    if (!start || !end || [end compare:start] != NSOrderedDescending) {
+        return NO;
+    }
+    for (NSDictionary *block in blocks ?: @[]) {
+        NSDate *blockStart = block[@"start"];
+        NSDate *blockEnd = block[@"end"];
+        if (!blockStart || !blockEnd) {
+            continue;
+        }
+        BOOL overlaps = [start compare:blockEnd] == NSOrderedAscending &&
+                        [end compare:blockStart] == NSOrderedDescending;
+        if (overlaps) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static NSArray *MergeAdjacentMixedActivityBlocks(NSArray *blocks,
-                                                 NSArray<NSMutableDictionary *> *segments) {
+                                                 NSArray<NSMutableDictionary *> *segments,
+                                                 NSTimeInterval maxGapSeconds,
+                                                 NSArray *blockingRanges) {
     if (blocks.count < 2) {
         return blocks ?: @[];
     }
@@ -2462,12 +2487,15 @@ static NSArray *MergeAdjacentMixedActivityBlocks(NSArray *blocks,
         NSMutableDictionary *previous = merged.lastObject;
         NSDate *previousEnd = previous[@"end"];
         NSDate *start = block[@"start"];
+        NSTimeInterval gap = previousEnd && start ? [start timeIntervalSinceDate:previousEnd] : DBL_MAX;
         BOOL canMerge = previous &&
             IsMixedActivityVisualBlock(previous) &&
             IsMixedActivityVisualBlock(block) &&
             previousEnd &&
             start &&
-            fabs([start timeIntervalSinceDate:previousEnd]) <= MinimumRecordedSegmentSeconds();
+            gap >= -MinimumRecordedSegmentSeconds() &&
+            gap <= maxGapSeconds &&
+            !IntervalOverlapsAnyBlock(previousEnd, start, blockingRanges);
         if (canMerge) {
             [merged removeLastObject];
             [merged addObject:MergedMixedActivityBlock(previous, block, segments)];
@@ -2491,7 +2519,10 @@ static NSArray *MixedWorkCandidatesFromSegments(NSArray<NSMutableDictionary *> *
         }
     }
 
-    NSArray *mergedFragments = MergeAdjacentMixedActivityBlocks(fragments, segments);
+    NSArray *mergedFragments = MergeAdjacentMixedActivityBlocks(fragments,
+                                                                segments,
+                                                                MixedWorkMergeGapSeconds(),
+                                                                existingCandidates);
     NSMutableArray *candidates = [NSMutableArray array];
     double minDuration = CalendarMinBlockSecondsSetting();
     for (NSDictionary *fragment in mergedFragments) {
@@ -2511,6 +2542,69 @@ static NSArray *MixedWorkCandidatesFromSegments(NSArray<NSMutableDictionary *> *
         [candidates addObject:candidate];
     }
     return candidates;
+}
+
+static BOOL IsMixedWorkCalendarBlock(NSDictionary *block) {
+    return [block[@"key"] isEqualToString:@"__mixed_work__"] ||
+           [block[@"kind"] isEqualToString:@"mixed"];
+}
+
+static NSMutableDictionary *MergedMixedWorkCalendarBlock(NSDictionary *left,
+                                                         NSDictionary *right,
+                                                         NSArray<NSMutableDictionary *> *segments) {
+    NSDate *start = left[@"start"];
+    NSDate *end = right[@"end"];
+    if (!start || !end || [end compare:start] != NSOrderedDescending) {
+        return [left mutableCopy];
+    }
+    NSArray *topApps = TopAppsForInterval(segments, start, end);
+    double observed = 0;
+    for (NSDictionary *app in topApps) {
+        observed += [app[@"seconds"] doubleValue];
+    }
+    double wall = [end timeIntervalSinceDate:start];
+    NSMutableDictionary *merged = [left mutableCopy];
+    merged[@"start"] = start;
+    merged[@"end"] = end;
+    merged[@"wall_seconds"] = @(wall);
+    merged[@"active_seconds"] = @(observed);
+    merged[@"observed_seconds"] = @(observed);
+    merged[@"active_ratio"] = @(wall > 0 ? MIN(1.0, observed / wall) : 0);
+    merged[@"top_apps"] = topApps;
+    merged[@"title"] = @"混合工作";
+    merged[@"event_title"] = @"混合工作";
+    merged[@"key"] = @"__mixed_work__";
+    merged[@"bundle_id"] = @"__mixed_work__";
+    merged[@"kind"] = @"mixed";
+    merged[@"mode"] = @"混合工作";
+    [merged removeObjectForKey:@"visual_layer"];
+    return merged;
+}
+
+static NSArray *MergeAdjacentMixedWorkCalendarBlocks(NSArray *candidates,
+                                                     NSArray<NSMutableDictionary *> *segments) {
+    if (candidates.count < 2) {
+        return candidates ?: @[];
+    }
+    NSMutableArray *merged = [NSMutableArray array];
+    for (NSDictionary *candidate in candidates) {
+        NSMutableDictionary *previous = merged.lastObject;
+        NSDate *previousEnd = previous[@"end"];
+        NSDate *start = candidate[@"start"];
+        NSTimeInterval gap = previousEnd && start ? [start timeIntervalSinceDate:previousEnd] : DBL_MAX;
+        BOOL canMerge = previous &&
+            IsMixedWorkCalendarBlock(previous) &&
+            IsMixedWorkCalendarBlock(candidate) &&
+            gap >= -MinimumRecordedSegmentSeconds() &&
+            gap <= MixedWorkMergeGapSeconds();
+        if (canMerge) {
+            [merged removeLastObject];
+            [merged addObject:MergedMixedWorkCalendarBlock(previous, candidate, segments)];
+        } else {
+            [merged addObject:[candidate mutableCopy]];
+        }
+    }
+    return merged;
 }
 
 static NSString *GapTitleForReason(NSString *reason) {
@@ -2893,6 +2987,7 @@ static NSArray *CalendarCandidatesIncludingManual(NSArray<NSMutableDictionary *>
         }
         return [a[@"end"] compare:b[@"end"]];
     }];
+    candidates = [MergeAdjacentMixedWorkCalendarBlocks(candidates, segments ?: @[]) mutableCopy];
     return candidates;
 }
 
@@ -2911,7 +3006,10 @@ static NSArray *VisualBlocksFromSegments(NSArray<NSMutableDictionary *> *segment
             }
         }
     }
-    NSArray *mergedMixed = MergeAdjacentMixedActivityBlocks(visual, segments);
+    NSArray *mergedMixed = MergeAdjacentMixedActivityBlocks(visual,
+                                                           segments,
+                                                           MixedWorkMergeGapSeconds(),
+                                                           candidates);
     visual = [mergedMixed mutableCopy];
 
     [visual addObjectsFromArray:GapBlocksFromSegments(segments, rangeEnd ?: [NSDate date])];
