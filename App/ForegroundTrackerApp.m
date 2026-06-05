@@ -2347,6 +2347,78 @@ static NSArray *MixedBlocksFromSegments(NSArray<NSMutableDictionary *> *segments
     return blocks;
 }
 
+static NSArray<NSDictionary *> *RangesBySubtractingCandidates(NSDate *start,
+                                                              NSDate *end,
+                                                              NSArray *candidates) {
+    if (!start || !end || [end compare:start] != NSOrderedDescending) {
+        return @[];
+    }
+    NSMutableArray<NSDictionary *> *visibleRanges = [NSMutableArray arrayWithObject:@{
+        @"start": start,
+        @"end": end
+    }];
+    for (NSDictionary *candidate in candidates ?: @[]) {
+        NSDate *candidateStart = candidate[@"start"];
+        NSDate *candidateEnd = candidate[@"end"];
+        if (!candidateStart || !candidateEnd) {
+            continue;
+        }
+        NSMutableArray<NSDictionary *> *nextRanges = [NSMutableArray array];
+        for (NSDictionary *range in visibleRanges) {
+            NSDate *rangeStart = range[@"start"];
+            NSDate *rangeEnd = range[@"end"];
+            BOOL overlaps = [rangeStart compare:candidateEnd] == NSOrderedAscending &&
+                            [rangeEnd compare:candidateStart] == NSOrderedDescending;
+            if (!overlaps) {
+                [nextRanges addObject:range];
+                continue;
+            }
+            NSDate *leftEnd = [candidateStart compare:rangeEnd] == NSOrderedAscending ? candidateStart : rangeEnd;
+            NSDate *rightStart = [candidateEnd compare:rangeStart] == NSOrderedDescending ? candidateEnd : rangeStart;
+            if ([leftEnd timeIntervalSinceDate:rangeStart] > MinimumRecordedSegmentSeconds()) {
+                [nextRanges addObject:@{@"start": rangeStart, @"end": leftEnd}];
+            }
+            if ([rangeEnd timeIntervalSinceDate:rightStart] > MinimumRecordedSegmentSeconds()) {
+                [nextRanges addObject:@{@"start": rightStart, @"end": rangeEnd}];
+            }
+        }
+        visibleRanges = nextRanges;
+        if (visibleRanges.count == 0) {
+            break;
+        }
+    }
+    return visibleRanges;
+}
+
+static NSMutableDictionary *MixedActivityBlockForRange(NSDictionary *mixedBlock,
+                                                       NSDate *rangeStart,
+                                                       NSDate *rangeEnd,
+                                                       NSArray<NSMutableDictionary *> *segments) {
+    double wall = [rangeEnd timeIntervalSinceDate:rangeStart];
+    if (wall <= MinimumRecordedSegmentSeconds()) {
+        return nil;
+    }
+    NSArray *topApps = TopAppsForInterval(segments, rangeStart, rangeEnd);
+    double observed = 0;
+    for (NSDictionary *app in topApps) {
+        observed += [app[@"seconds"] doubleValue];
+    }
+    if (observed <= MinimumRecordedSegmentSeconds()) {
+        return nil;
+    }
+    NSMutableDictionary *partial = [mixedBlock mutableCopy];
+    partial[@"start"] = rangeStart;
+    partial[@"end"] = rangeEnd;
+    partial[@"wall_seconds"] = @(wall);
+    partial[@"active_seconds"] = @(observed);
+    partial[@"observed_seconds"] = @(observed);
+    partial[@"active_ratio"] = @(wall > 0 ? MIN(1.0, observed / wall) : 0);
+    partial[@"top_apps"] = topApps;
+    partial[@"granularity"] = wall >= 590 ? @"10分钟" : @"补足";
+    partial[@"visual_layer"] = @"activity";
+    return partial;
+}
+
 static BOOL IsMixedActivityVisualBlock(NSDictionary *block) {
     return [block[@"visual_layer"] isEqualToString:@"activity"] &&
            [block[@"key"] isEqualToString:@"__mixed__"];
@@ -2404,6 +2476,41 @@ static NSArray *MergeAdjacentMixedActivityBlocks(NSArray *blocks,
         }
     }
     return merged;
+}
+
+static NSArray *MixedWorkCandidatesFromSegments(NSArray<NSMutableDictionary *> *segments,
+                                                NSArray *existingCandidates) {
+    NSMutableArray *fragments = [NSMutableArray array];
+    for (NSDictionary *mixedBlock in MixedBlocksFromSegments(segments)) {
+        NSArray *ranges = RangesBySubtractingCandidates(mixedBlock[@"start"], mixedBlock[@"end"], existingCandidates);
+        for (NSDictionary *range in ranges) {
+            NSMutableDictionary *fragment = MixedActivityBlockForRange(mixedBlock, range[@"start"], range[@"end"], segments);
+            if (fragment) {
+                [fragments addObject:fragment];
+            }
+        }
+    }
+
+    NSArray *mergedFragments = MergeAdjacentMixedActivityBlocks(fragments, segments);
+    NSMutableArray *candidates = [NSMutableArray array];
+    double minDuration = CalendarMinBlockSecondsSetting();
+    for (NSDictionary *fragment in mergedFragments) {
+        double wall = [fragment[@"wall_seconds"] doubleValue];
+        double observed = [fragment[@"observed_seconds"] doubleValue];
+        if (wall < minDuration || observed < minDuration) {
+            continue;
+        }
+        NSMutableDictionary *candidate = [fragment mutableCopy];
+        candidate[@"title"] = @"混合工作";
+        candidate[@"event_title"] = @"混合工作";
+        candidate[@"key"] = @"__mixed_work__";
+        candidate[@"bundle_id"] = @"__mixed_work__";
+        candidate[@"kind"] = @"mixed";
+        candidate[@"mode"] = @"混合工作";
+        [candidate removeObjectForKey:@"visual_layer"];
+        [candidates addObject:candidate];
+    }
+    return candidates;
 }
 
 static NSString *GapTitleForReason(NSString *reason) {
@@ -2778,6 +2885,7 @@ static NSArray *CalendarCandidatesIncludingManual(NSArray<NSMutableDictionary *>
     NSMutableArray *candidates = [CalendarCandidatesFromSegments(segments ?: @[]) mutableCopy] ?: [NSMutableArray array];
     [candidates addObjectsFromArray:ResidentMeetingCandidatesFromSegments(residentSegments ?: @[])];
     [candidates addObjectsFromArray:ManualCalendarCandidatesFromRecords(manualRecords, segments ?: @[], day ?: [NSDate date])];
+    [candidates addObjectsFromArray:MixedWorkCandidatesFromSegments(segments ?: @[], candidates)];
     [candidates sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         NSComparisonResult result = [a[@"start"] compare:b[@"start"]];
         if (result != NSOrderedSame) {
@@ -2792,64 +2900,15 @@ static NSArray *VisualBlocksFromSegments(NSArray<NSMutableDictionary *> *segment
     NSMutableArray *visual = [NSMutableArray array];
     NSArray *mixed = MixedBlocksFromSegments(segments);
     for (NSDictionary *mixedBlock in mixed) {
-        NSMutableArray<NSDictionary *> *visibleRanges = [NSMutableArray arrayWithObject:@{
-            @"start": mixedBlock[@"start"],
-            @"end": mixedBlock[@"end"]
-        }];
-        for (NSDictionary *candidate in candidates) {
-            NSDate *candidateStart = candidate[@"start"];
-            NSDate *candidateEnd = candidate[@"end"];
-            NSMutableArray<NSDictionary *> *nextRanges = [NSMutableArray array];
-            for (NSDictionary *range in visibleRanges) {
-                NSDate *rangeStart = range[@"start"];
-                NSDate *rangeEnd = range[@"end"];
-                BOOL overlaps = [rangeStart compare:candidateEnd] == NSOrderedAscending &&
-                                [rangeEnd compare:candidateStart] == NSOrderedDescending;
-                if (!overlaps) {
-                    [nextRanges addObject:range];
-                    continue;
-                }
-                NSDate *leftEnd = [candidateStart compare:rangeEnd] == NSOrderedAscending ? candidateStart : rangeEnd;
-                NSDate *rightStart = [candidateEnd compare:rangeStart] == NSOrderedDescending ? candidateEnd : rangeStart;
-                if ([leftEnd timeIntervalSinceDate:rangeStart] > MinimumRecordedSegmentSeconds()) {
-                    [nextRanges addObject:@{@"start": rangeStart, @"end": leftEnd}];
-                }
-                if ([rangeEnd timeIntervalSinceDate:rightStart] > MinimumRecordedSegmentSeconds()) {
-                    [nextRanges addObject:@{@"start": rightStart, @"end": rangeEnd}];
-                }
-            }
-            visibleRanges = nextRanges;
-            if (visibleRanges.count == 0) {
-                break;
-            }
-        }
+        NSArray<NSDictionary *> *visibleRanges = RangesBySubtractingCandidates(mixedBlock[@"start"], mixedBlock[@"end"], candidates);
 
         for (NSDictionary *range in visibleRanges) {
             NSDate *rangeStart = range[@"start"];
             NSDate *rangeEnd = range[@"end"];
-            double wall = [rangeEnd timeIntervalSinceDate:rangeStart];
-            if (wall <= MinimumRecordedSegmentSeconds()) {
-                continue;
+            NSMutableDictionary *partial = MixedActivityBlockForRange(mixedBlock, rangeStart, rangeEnd, segments);
+            if (partial) {
+                [visual addObject:partial];
             }
-            NSArray *topApps = TopAppsForInterval(segments, rangeStart, rangeEnd);
-            double observed = 0;
-            for (NSDictionary *app in topApps) {
-                observed += [app[@"seconds"] doubleValue];
-            }
-            if (observed <= MinimumRecordedSegmentSeconds()) {
-                continue;
-            }
-            NSMutableDictionary *partial = [mixedBlock mutableCopy];
-            partial[@"start"] = rangeStart;
-            partial[@"end"] = rangeEnd;
-            partial[@"wall_seconds"] = @(wall);
-            partial[@"active_seconds"] = @(observed);
-            partial[@"observed_seconds"] = @(observed);
-            partial[@"active_ratio"] = @(wall > 0 ? MIN(1.0, observed / wall) : 0);
-            partial[@"top_apps"] = topApps;
-            partial[@"granularity"] = wall >= 590 ? @"10分钟" : @"补足";
-            partial[@"visual_layer"] = @"activity";
-            [visual addObject:partial];
         }
     }
     NSArray *mergedMixed = MergeAdjacentMixedActivityBlocks(visual, segments);
