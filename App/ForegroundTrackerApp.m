@@ -2347,6 +2347,65 @@ static NSArray *MixedBlocksFromSegments(NSArray<NSMutableDictionary *> *segments
     return blocks;
 }
 
+static BOOL IsMixedActivityVisualBlock(NSDictionary *block) {
+    return [block[@"visual_layer"] isEqualToString:@"activity"] &&
+           [block[@"key"] isEqualToString:@"__mixed__"];
+}
+
+static NSMutableDictionary *MergedMixedActivityBlock(NSDictionary *left,
+                                                     NSDictionary *right,
+                                                     NSArray<NSMutableDictionary *> *segments) {
+    NSDate *start = left[@"start"];
+    NSDate *end = right[@"end"];
+    if (!start || !end || [end compare:start] != NSOrderedDescending) {
+        return [left mutableCopy];
+    }
+    NSArray *topApps = TopAppsForInterval(segments, start, end);
+    double observed = 0;
+    for (NSDictionary *app in topApps) {
+        observed += [app[@"seconds"] doubleValue];
+    }
+    double wall = [end timeIntervalSinceDate:start];
+    NSMutableDictionary *merged = [left mutableCopy];
+    merged[@"start"] = start;
+    merged[@"end"] = end;
+    merged[@"wall_seconds"] = @(wall);
+    merged[@"active_seconds"] = @(observed);
+    merged[@"observed_seconds"] = @(observed);
+    merged[@"active_ratio"] = @(wall > 0 ? MIN(1.0, observed / wall) : 0);
+    merged[@"top_apps"] = topApps;
+    merged[@"granularity"] = @"合并";
+    NSDictionary *dominant = topApps.firstObject;
+    merged[@"dominant_key"] = dominant[@"key"] ?: @"";
+    return merged;
+}
+
+static NSArray *MergeAdjacentMixedActivityBlocks(NSArray *blocks,
+                                                 NSArray<NSMutableDictionary *> *segments) {
+    if (blocks.count < 2) {
+        return blocks ?: @[];
+    }
+    NSMutableArray *merged = [NSMutableArray array];
+    for (NSDictionary *block in blocks) {
+        NSMutableDictionary *previous = merged.lastObject;
+        NSDate *previousEnd = previous[@"end"];
+        NSDate *start = block[@"start"];
+        BOOL canMerge = previous &&
+            IsMixedActivityVisualBlock(previous) &&
+            IsMixedActivityVisualBlock(block) &&
+            previousEnd &&
+            start &&
+            fabs([start timeIntervalSinceDate:previousEnd]) <= MinimumRecordedSegmentSeconds();
+        if (canMerge) {
+            [merged removeLastObject];
+            [merged addObject:MergedMixedActivityBlock(previous, block, segments)];
+        } else {
+            [merged addObject:[block mutableCopy]];
+        }
+    }
+    return merged;
+}
+
 static NSString *GapTitleForReason(NSString *reason) {
     if ([reason isEqualToString:@"idle"]) {
         return @"空闲";
@@ -2793,6 +2852,8 @@ static NSArray *VisualBlocksFromSegments(NSArray<NSMutableDictionary *> *segment
             [visual addObject:partial];
         }
     }
+    NSArray *mergedMixed = MergeAdjacentMixedActivityBlocks(visual, segments);
+    visual = [mergedMixed mutableCopy];
 
     [visual addObjectsFromArray:GapBlocksFromSegments(segments, rangeEnd ?: [NSDate date])];
     for (NSDictionary *segment in segments) {
